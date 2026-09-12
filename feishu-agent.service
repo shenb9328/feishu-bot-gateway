@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/shenb9328_gmail_com/.gemini/antigravity-cli/scratch/feishu_agent
-Environment="PATH=/home/shenb9328_gmail_com/.gemini/antigravity-cli/bin:/home/shenb9328_gmail_com/.local/bin:/usr/local/bin:/usr/bin:/bin"
+WorkingDirectory=%h/.feishu-agent
+Environment="PATH=%h/.gemini/antigravity-cli/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/bin/python3 -u /home/shenb9328_gmail_com/.gemini/antigravity-cli/scratch/feishu_agent/bot_gateway.py
+ExecStart=/usr/bin/python3 -u %h/.feishu-agent/bot_gateway.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

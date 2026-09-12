@@ -8,7 +8,7 @@ class SessionManager:
     def __init__(self, storage_path: str, default_root: str):
         self.storage_path = storage_path
         self.default_root = default_root
-        self.home_dir = "/home/shenb9328_gmail_com"
+        self.home_dir = os.path.expanduser("~")
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self._load()
 
