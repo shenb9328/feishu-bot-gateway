@@ -1,0 +1,18 @@
+[Unit]
+Description=Feishu Agent Gateway (Antigravity Bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/shenb9328_gmail_com/.gemini/antigravity-cli/scratch/feishu_agent
+Environment="PATH=/home/shenb9328_gmail_com/.gemini/antigravity-cli/bin:/home/shenb9328_gmail_com/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 -u /home/shenb9328_gmail_com/.gemini/antigravity-cli/scratch/feishu_agent/bot_gateway.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

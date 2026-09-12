@@ -1,0 +1,224 @@
+import os
+import re
+import sys
+import json
+import time
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from typing import Any
+
+import lark_oapi as lark
+import lark_oapi.api.im.v1 as im_v1
+
+from session_manager import SessionManager
+import card_builder
+
+# Paths and Config
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+SESSIONS_PATH = os.path.join(BASE_DIR, "sessions.json")
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+APP_ID = config["app_id"]
+APP_SECRET = config["app_secret"]
+DEFAULT_ROOT = config.get("projects_root", os.path.expanduser("~/.gemini/antigravity-cli/scratch"))
+ALLOWED_OPEN_IDS = set(config.get("allowed_open_ids", []))
+BOT_OPEN_ID = "ou_8f587e25b11315e9c4a34132efdfc0f0"
+
+session_mgr = SessionManager(SESSIONS_PATH, DEFAULT_ROOT)
+executor = ThreadPoolExecutor(max_workers=5)
+
+# Deduplication cache
+processed_msg_ids = set()
+msg_id_queue = deque(maxlen=500)
+lock = threading.Lock()
+
+# Feishu API Client
+client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).log_level(lark.LogLevel.INFO).build()
+
+# ----------------- Message Sending -----------------
+def reply_message(message_id: str, content: Any, msg_type: str = "text"):
+    """Unified message replier for text and cards."""
+    try:
+        if msg_type == "interactive":
+            body = im_v1.ReplyMessageRequestBody.builder().content(json.dumps(content)).msg_type("interactive").build()
+            resp = client.im.v1.message.reply(im_v1.ReplyMessageRequest.builder().message_id(message_id).request_body(body).build())
+            if not resp.success():
+                print(f"[Feishu] Card reply error: {resp.code} {resp.msg}, fallback to text")
+                reply_message(message_id, "⚠️ 卡片渲染失败，请直接使用纯文本指令。")
+        else:
+            text = str(content)
+            chunks = [text[i:i+3800] for i in range(0, len(text), 3800)] or ["(空输出)"]
+            for chunk in chunks:
+                body = im_v1.ReplyMessageRequestBody.builder().content(json.dumps({"text": chunk})).msg_type("text").build()
+                client.im.v1.message.reply(im_v1.ReplyMessageRequest.builder().message_id(message_id).request_body(body).build())
+    except Exception as e:
+        print(f"[Feishu] reply_message failed: {e}")
+
+# ----------------- Command Handlers -----------------
+def cmd_help(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
+    sess = session_mgr.get_session(session_key)
+    conv_title = f"`{sess['conversation_id'][:8]}...`" if sess.get("conversation_id") else "无（等待首条指令）"
+    card = card_builder.build_menu_card(sess["project_name"], sess["project_dir"], conv_title)
+    reply_message(message_id, card, "interactive")
+
+def cmd_status(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
+    sess = session_mgr.get_session(session_key)
+    recent = "".join([f"\n  • [{h['time']}] {h['prompt']}" for h in sess.get("history", [])[-3:]]) or " 暂无"
+    msg = (
+        f"📊 【工作台状态】\n"
+        f"• 会话标识: {session_key}\n"
+        f"• 绑定项目: 📁 {sess['project_name']}\n"
+        f"• 工作目录: `{sess['project_dir']}`\n"
+        f"• Agent 会话 ID: {sess.get('conversation_id') or '🆕 新会话'}\n"
+        f"• 最近任务记录:{recent}"
+    )
+    reply_message(message_id, msg)
+
+def cmd_projects(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
+    projs = session_mgr.list_projects()
+    sess = session_mgr.get_session(session_key)
+    card = card_builder.build_projects_card(sess["project_name"], projs)
+    reply_message(message_id, card, "interactive")
+
+def cmd_project(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
+    if len(parts) < 2:
+        reply_message(message_id, "⚠️ 请指定项目名，例如: `/project 飞书`")
+        return
+    proj_name = parts[1]
+    sess = session_mgr.set_project(session_key, proj_name, parent_chat_id)
+    reply_message(message_id, f"✅ 已成功切换到项目【📁 {sess['project_name']}】！\n工作目录: `{sess['project_dir']}`\n（上一会话已归档，已开启新上下文）")
+
+def cmd_history(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
+    histories = session_mgr.get_history_list(session_key, limit=8)
+    sess = session_mgr.get_session(session_key)
+    card = card_builder.build_history_card(sess.get("conversation_id"), histories)
+    reply_message(message_id, card, "interactive")
+
+def cmd_switch(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
+    if len(parts) < 2:
+        reply_message(message_id, "⚠️ 请指定要切换的历史会话序号，例如: `/switch 1`")
+        return
+    target_conv = session_mgr.switch_to_conversation(session_key, parts[1])
+    if target_conv:
+        reply_message(message_id, f"✅ 成功切回历史会话！\n• 主题: 💬 {target_conv['title']}\n• 会话 ID: `{target_conv['id']}`\n接下来的对话将继承该会话的全部历史记忆！")
+    else:
+        reply_message(message_id, f"❌ 未找到序号或 ID 为「{parts[1]}」的历史会话。请输入 `/history` 查看可用列表。")
+
+def cmd_new(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
+    sess = session_mgr.reset_conversation(session_key)
+    reply_message(message_id, f"🔄 已为您开启全新会话！\n当前项目仍为【📁 {sess['project_name']}】，上一会话已自动归档至 `/history`。")
+
+# Command Dispatch Map
+COMMANDS = {
+    "/help": cmd_help, "help": cmd_help, "帮助": cmd_help, "/menu": cmd_help, "menu": cmd_help, "/card": cmd_help,
+    "/status": cmd_status, "status": cmd_status, "状态": cmd_status, "/状态": cmd_status,
+    "/projects": cmd_projects, "projects": cmd_projects, "/项目": cmd_projects, "项目": cmd_projects,
+    "/project": cmd_project, "project": cmd_project, "切项目": cmd_project,
+    "/history": cmd_history, "history": cmd_history, "/历史": cmd_history, "历史": cmd_history,
+    "/switch": cmd_switch, "switch": cmd_switch, "/resume": cmd_switch, "resume": cmd_switch, "切回": cmd_switch,
+    "/new": cmd_new, "new": cmd_new, "/clear": cmd_new, "clear": cmd_new, "新建会话": cmd_new,
+}
+
+# ----------------- Agent Task Execution -----------------
+def execute_agent_task(session_key: str, message_id: str, prompt: str):
+    """Executes prompt via agy CLI and returns response."""
+    sess = session_mgr.get_session(session_key)
+    project_dir = sess["project_dir"]
+    conv_id = sess.get("conversation_id")
+
+    cmd = ["/usr/local/bin/agy", "-p", prompt, "--output-format", "json", "--dangerously-skip-permissions"]
+    if conv_id:
+        cmd.extend(["--conversation", conv_id])
+
+    print(f"[Agent] Running in {project_dir} [{conv_id or 'NEW'}]: {prompt[:50]}...")
+    start_t = time.time()
+    try:
+        proc = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        elapsed = round(time.time() - start_t, 1)
+
+        if proc.returncode != 0:
+            err = proc.stderr.strip() or proc.stdout.strip() or f"Code: {proc.returncode}"
+            print(f"[Agent Error] {err}")
+            reply_message(message_id, f"❌ 执行异常 ({elapsed}s):\n{err}")
+            return
+
+        try:
+            res_json = json.loads(proc.stdout.strip())
+            new_cid = res_json.get("conversation_id")
+            if new_cid:
+                session_mgr.update_conversation(session_key, new_cid, prompt)
+            reply_message(message_id, res_json.get("response", "").strip() or "✅ 任务执行完毕。")
+        except json.JSONDecodeError:
+            reply_message(message_id, proc.stdout.strip() or "✅ 任务完成。")
+
+    except subprocess.TimeoutExpired:
+        reply_message(message_id, "⏱️ 任务执行超时（超过 5 分钟），已自动中止。")
+    except Exception as e:
+        reply_message(message_id, f"⚠️ 处理异常: {str(e)}")
+
+# ----------------- Feishu Event Callback -----------------
+def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
+    try:
+        msg = data.event.message
+        sender = data.event.sender
+        msg_id, chat_id, chat_type = msg.message_id, msg.chat_id, msg.chat_type
+        open_id = sender.sender_id.open_id if sender and sender.sender_id else ""
+        sender_type = sender.sender_type if sender else ""
+
+        # Ignore self & unauthorized
+        if sender_type in ["app", "bot"] or open_id == BOT_OPEN_ID:
+            return
+        if ALLOWED_OPEN_IDS and open_id not in ALLOWED_OPEN_IDS:
+            return
+
+        # Deduplication
+        with lock:
+            if msg_id in processed_msg_ids:
+                return
+            processed_msg_ids.add(msg_id)
+            msg_id_queue.append(msg_id)
+
+        if msg.message_type != "text":
+            reply_message(msg_id, "ℹ️ 目前支持文本指令和任务。")
+            return
+
+        raw_text = json.loads(msg.content).get("text", "").strip()
+        clean_text = re.sub(r"@_user_\d+\s*", "", raw_text).strip()
+        if not clean_text:
+            return
+
+        # Topic Groups vs Private Chats
+        parent_chat_id = chat_id if chat_type == "group" else None
+        session_key = f"topic:{chat_id}:{msg.root_id or msg_id}" if chat_type == "group" else chat_id
+
+        parts = clean_text.split()
+        cmd = parts[0].lower() if parts else ""
+
+        # Route Command or Dispatch Agent Task
+        if cmd in COMMANDS:
+            COMMANDS[cmd](session_key, msg_id, parts, parent_chat_id)
+        else:
+            executor.submit(execute_agent_task, session_key, msg_id, clean_text)
+
+    except Exception as e:
+        print(f"[Feishu Error] {e}")
+
+# ----------------- Main Entrypoint -----------------
+def main():
+    print("=" * 60)
+    print("🚀 Antigravity 飞书全能网关 (Feishu Agent Gateway v4.0 - 精炼优化版)")
+    print(f"• App ID: {APP_ID} | 工作区根目录: {DEFAULT_ROOT}")
+    print("=" * 60)
+
+    handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message_received).build()
+    ws_client = lark.ws.Client(app_id=APP_ID, app_secret=APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)
+    print("WebSocket 监听建立成功，服务持续运行中...")
+    ws_client.start()
+
+if __name__ == "__main__":
+    main()

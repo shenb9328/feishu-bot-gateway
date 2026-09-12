@@ -1,0 +1,22 @@
+# Secrets and configs with credentials
+config.json
+*.pem
+*.key
+
+# Runtime states and sessions
+sessions.json
+topic_projects.json
+*.log
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db

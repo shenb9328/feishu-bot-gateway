@@ -1,0 +1,6 @@
+{
+  "app_id": "cli_xxxxxxxxxxxxxxxx",
+  "app_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "projects_root": "/home/your_username",
+  "allowed_open_ids": []
+}
