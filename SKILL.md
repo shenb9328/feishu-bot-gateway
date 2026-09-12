@@ -1,6 +1,6 @@
 ---
 name: feishu-agent
-description: 全局飞书全能智能体网关（Feishu Agent Gateway）。基于飞书官方 WebSocket 长连接（无需公网 IP / 域名 / 端口映射），将 Antigravity 智能体深度接入飞书客户端。支持私聊与话题群双工对话、多项目工作区自动发现与切换、多轮会话记忆隔离、富文本交互卡片、免 @ 直接交互以及 Systemd 守护进程开机自启。
+description: 全局飞书全能智能体网关（Feishu Agent Gateway）。基于飞书官方 WebSocket 长连接（无需公网 IP / 域名 / 端口映射），将 Antigravity 智能体深度接入飞书客户端。支持单内核多租户并发多机器人（1个 agy 对接 n 个账号 m 个机器人）、私聊与话题群双工对话、多项目工作区自动发现与切换、多轮会话记忆隔离、富文本交互卡片、免 @ 直接交互以及 Systemd 守护进程开机自启。
 ---
 
 # 飞书全能智能体网关 (Feishu Agent Gateway) 技能指南
@@ -11,30 +11,40 @@ description: 全局飞书全能智能体网关（Feishu Agent Gateway）。基�
 
 ```mermaid
 flowchart LR
-    User[你（手机 / 电脑飞书）]
-    LarkCloud[飞书消息网关]
-    Gateway[feishu-agent 网关服务\n(Python WebSocket)]
-    AgyEngine[Antigravity 智能体\n(agy CLI / Agent 内核)]
-    Workspace[项目工作区 / Linux 环境]
+    subgraph 飞书多租户平台
+        Bot1[飞书账号 A: 机器人 1]
+        Bot2[飞书账号 B: 机器人 m]
+    end
+    subgraph 网关服务托管 [Linux Systemd]
+        GW1[feishu-agent 默认实例]
+        GW2[feishu-agent@bot2 实例]
+    end
+    subgraph Antigravity 智能体引擎
+        Agy[统一 Agent 执行内核\n(agy CLI)]
+        Workspace[项目工作区 / Linux 宿主环境]
+    end
 
-    User -->|发送指令| LarkCloud
-    LarkCloud ==WebSocket长连接 (无需公网IP)==> Gateway
-    Gateway -->|多轮上下文调度| AgyEngine
-    AgyEngine -->|执行命令 / 读写文件| Workspace
-    AgyEngine -->|产出回复| Gateway
-    Gateway ==推送交互卡片/文本==> LarkCloud
-    LarkCloud --> User
+    Bot1 ==WebSocket长连接==> GW1
+    Bot2 ==WebSocket长连接==> GW2
+    GW1 -->|上下文隔离调度| Agy
+    GW2 -->|上下文隔离调度| Agy
+    Agy <--> Workspace
+    Agy --> GW1
+    Agy --> GW2
+    GW1 ==推送结果==> Bot1
+    GW2 ==推送结果==> Bot2
 ```
 
 ### 核心亮点
-1. **无需公网 IP / 域名 / 内网穿透**：基于飞书官方 WebSocket 长连接，云开发机、本地虚拟机均可秒级接入。
-2. **多项目工作区隔离**：自动识别主目录下项目目录（如 `~/项目A`、`~/项目B`），指令无缝切换工作目录。
-3. **话题群（Topic Group）1:1 映射**：
+1. **单内核驱动多租户与多机器人**：1 个 `agy` 引擎可同时连接 \(n\) 个飞书租户下的 \(m\) 个机器人，多实例物理隔离。
+2. **无需公网 IP / 域名 / 内网穿透**：基于飞书官方 WebSocket 长连接，云开发机、本地虚拟机均可秒级接入。
+3. **多项目工作区隔离**：自动识别主目录下项目目录（如 `~/项目A`、`~/项目B`），指令无缝切换工作目录。
+4. **话题群（Topic Group）1:1 映射**：
    - 群组 = 项目（Project / Workspace）；
    - 群内话题（Topic）= 会话（Conversation）；
    - 左侧栏话题列表随时点选切换，右侧独立承接上下文。
-4. **彻底免 @ 交互**：群内像与真人对话一样直接发文本按回车，机器人秒级响应。
-5. **开机与崩溃自愈守护**：通过 Linux Systemd 用户级服务托管，配置 Linger 免登录自启，服务永久在线。
+5. **彻底免 @ 交互**：群内像与真人对话一样直接发文本按回车，机器人秒级响应。
+6. **开机与崩溃自愈守护**：通过 Linux Systemd 模板服务托管，配置 Linger 免登录自启，服务永久在线。
 
 ---
 
@@ -94,20 +104,24 @@ chmod +x install.sh
 
 ---
 
-## 5. 常用运维与服务管理
+## 5. 常用运维与多实例管理
 
-网关由 Linux Systemd 用户级守护进程管理：
+网关由 Linux Systemd 用户级守护进程与模板单元管理：
 
 ```bash
-# 查看服务运行状态
+# 查看默认实例状态
 systemctl --user status feishu-agent
 
 # 查看实时日志
 journalctl --user -u feishu-agent -f
 
-# 重启网关服务
-systemctl --user restart feishu-agent
+# 启动新的机器人实例 (例如 config.ops.json)
+systemctl --user enable --now feishu-agent@ops
 
-# 停止网关服务
-systemctl --user stop feishu-agent
+# 查看特定机器人实例状态与日志
+systemctl --user status feishu-agent@ops
+journalctl --user -u feishu-agent@ops -f
+
+# 查看所有运行中的机器人服务
+systemctl --user list-units "feishu-agent*"
 ```

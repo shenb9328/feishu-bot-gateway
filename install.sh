@@ -52,8 +52,8 @@ rm -rf "$SKILLS_DIR"
 ln -sf "$SCRIPT_DIR" "$SKILLS_DIR"
 echo "✅ 已成功将技能软链接至: $SKILLS_DIR"
 
-# 5. 配置 Systemd 用户守护进程
-echo "⚙️ 正在配置 Systemd 用户守护服务..."
+# 5. 配置 Systemd 用户守护进程与多实例模板
+echo "⚙️ 正在配置 Systemd 用户守护服务与多实例模板..."
 mkdir -p "$SYSTEMD_USER_DIR"
 cat << SSERVICE > "$SYSTEMD_USER_DIR/feishu-agent.service"
 [Unit]
@@ -75,6 +75,27 @@ StandardError=journal
 [Install]
 WantedBy=default.target
 SSERVICE
+
+cat << TTEMP > "$SYSTEMD_USER_DIR/feishu-agent@.service"
+[Unit]
+Description=Feishu Agent Gateway (Antigravity Bridge) - %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$SCRIPT_DIR
+Environment="PATH=$HOME/.gemini/antigravity-cli/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 -u $SCRIPT_DIR/bot_gateway.py --config config.%i.json
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+TTEMP
 
 systemctl --user daemon-reload
 systemctl --user enable feishu-agent.service

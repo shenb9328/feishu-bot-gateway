@@ -1,10 +1,15 @@
 # Secrets and configs with credentials
 config.json
+config.*.json
+!config.example.json
+!config.json.example
 *.pem
 *.key
 
 # Runtime states and sessions
 sessions.json
+sessions.*.json
+chat_bindings*.json
 topic_projects.json
 *.log
 

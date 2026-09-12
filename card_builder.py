@@ -1,44 +1,49 @@
-def build_menu_card(project_name: str, project_dir: str, conv_title: str) -> dict:
+def build_menu_card(project_name: str, project_dir: str, conv_title: str, channel_name: str = None) -> dict:
+    fields = [
+        {"is_short": True, "text": {"tag": "lark_md", "content": f"**📁 绑定项目:**\n`{project_name}`"}},
+        {"is_short": True, "text": {"tag": "lark_md", "content": f"**💬 当前会话:**\n{conv_title}"}}
+    ]
+    if channel_name:
+        fields.insert(0, {"is_short": True, "text": {"tag": "lark_md", "content": f"**🏢 所属频道:**\n{channel_name}"}})
+
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"tag": "plain_text", "content": "🤖 工作台控制面板"}, "template": "blue"},
         "elements": [
             {
                 "tag": "div",
-                "fields": [
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**📁 当前工作区:**\n`{project_name}`"}},
-                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**💬 当前会话:**\n{conv_title}"}}
-                ]
+                "fields": fields
             },
-            {"tag": "div", "text": {"tag": "lark_md", "content": f"**📂 本地路径:** `{project_dir}`"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"**📂 工作区目录:** `{project_dir}`"}},
             {"tag": "hr"},
             {
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
                     "content": (
-                        "📋 **快捷操作指引：**\n"
-                        "• `/projects` —— 查看与选择工作区项目\n"
-                        "• `/project <名称>` —— 切换或新建项目目录\n"
-                        "• `/history` —— 查看当前会话历史列表\n"
-                        "• `/switch <序号>` —— 切换至指定历史会话\n"
-                        "• `/new` —— 开启当前项目的全新会话\n\n"
-                        "💡 **直接对话**：发送任意任务指令，AI 即可在本地工作区自动执行并回报！"
+                        "📋 **话题群与项目协作指引：**\n"
+                        "• **新建话题即开启新会话**：在群内直接发送新指令发起新话题，AI 自动在对应项目目录下执行！\n"
+                        "• **话题内连续跟进**：点击左侧话题列表，即可在右侧继承该话题的全部上下文！\n"
+                        "• `/project <名称>` —— 更改本频道或当前会话绑定的本地项目目录\n"
+                        "• `/projects` —— 查看本机所有项目目录及频道绑定状态\n"
+                        "• `/status` —— 查看当前频道与话题会话的详细状态\n"
+                        "• `/new` —— 在当前话题内重置记忆开启新上下文"
                     )
                 }
             }
         ]
     }
 
-def build_projects_card(current_project: str, projects: list) -> dict:
+def build_projects_card(current_project: str, projects: list, channel_name: str = None) -> dict:
     lines = [f"• **👉 📁 {p}** （当前激活）" if p == current_project else f"• 📁 `{p}`" for p in projects]
+    ch_info = f"**🏢 当前频道：** `{channel_name}`\n" if channel_name else ""
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"tag": "plain_text", "content": "📂 项目工作区列表"}, "template": "indigo"},
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": "**现有项目目录：**\n" + "\n".join(lines)}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"{ch_info}**本机可用项目工作区：**\n" + "\n".join(lines)}},
             {"tag": "hr"},
-            {"tag": "div", "text": {"tag": "lark_md", "content": "👉 发送 `/project <项目名>`（如 `/project 飞书`）即可切换目标目录！"}}
+            {"tag": "div", "text": {"tag": "lark_md", "content": "👉 发送 `/project <项目名>`（如 `/project 飞书`）即可为本频道重新绑定项目目录！"}}
         ]
     }
 

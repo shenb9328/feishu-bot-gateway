@@ -1,13 +1,15 @@
+import argparse
 import os
 import re
 import sys
 import json
 import time
+import requests
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
-from typing import Any
+from typing import Any, Dict
 
 import lark_oapi as lark
 import lark_oapi.api.im.v1 as im_v1
@@ -15,21 +17,62 @@ import lark_oapi.api.im.v1 as im_v1
 from session_manager import SessionManager
 import card_builder
 
-# Paths and Config
+# Command-line & Configuration Parsing
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-SESSIONS_PATH = os.path.join(BASE_DIR, "sessions.json")
+
+parser = argparse.ArgumentParser(description="Feishu Agent Gateway (Antigravity Bridge)")
+parser.add_argument("-c", "--config", default=os.getenv("FEISHU_AGENT_CONFIG", "config.json"), help="Path to config JSON file")
+args = parser.parse_args()
+
+config_arg = args.config
+if not os.path.isabs(config_arg):
+    if os.path.exists(config_arg):
+        CONFIG_PATH = os.path.abspath(config_arg)
+    else:
+        CONFIG_PATH = os.path.join(BASE_DIR, config_arg)
+else:
+    CONFIG_PATH = config_arg
+
+if not os.path.exists(CONFIG_PATH):
+    print(f"❌ Error: Config file not found: {CONFIG_PATH}")
+    sys.exit(1)
 
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     config = json.load(f)
+
+# Instance Tag & Dynamic Storage Isolation
+config_filename = os.path.basename(CONFIG_PATH)
+if config_filename == "config.json":
+    tag = "default"
+elif config_filename.startswith("config.") and config_filename.endswith(".json"):
+    tag = config_filename[7:-5]
+elif config_filename.startswith("config_") and config_filename.endswith(".json"):
+    tag = config_filename[7:-5]
+else:
+    tag = os.path.splitext(config_filename)[0]
+
+if "sessions_path" in config:
+    SESSIONS_PATH = os.path.expanduser(config["sessions_path"])
+elif tag == "default":
+    SESSIONS_PATH = os.path.join(BASE_DIR, "sessions.json")
+else:
+    SESSIONS_PATH = os.path.join(BASE_DIR, f"sessions.{tag}.json")
+
+if "bindings_path" in config:
+    BINDINGS_PATH = os.path.expanduser(config["bindings_path"])
+elif tag == "default":
+    BINDINGS_PATH = os.path.join(BASE_DIR, "chat_bindings.json")
+else:
+    BINDINGS_PATH = os.path.join(BASE_DIR, f"chat_bindings.{tag}.json")
 
 APP_ID = config["app_id"]
 APP_SECRET = config["app_secret"]
 DEFAULT_ROOT = config.get("projects_root", os.path.expanduser("~/.gemini/antigravity-cli/scratch"))
 ALLOWED_OPEN_IDS = set(config.get("allowed_open_ids", []))
-BOT_OPEN_ID = "ou_8f587e25b11315e9c4a34132efdfc0f0"
+BOT_OPEN_ID = config.get("bot_open_id", "")
+BOT_NAME = config.get("bot_name", "")
 
-session_mgr = SessionManager(SESSIONS_PATH, DEFAULT_ROOT)
+session_mgr = SessionManager(SESSIONS_PATH, DEFAULT_ROOT, BINDINGS_PATH)
 executor = ThreadPoolExecutor(max_workers=5)
 
 # Deduplication cache
@@ -37,8 +80,119 @@ processed_msg_ids = set()
 msg_id_queue = deque(maxlen=500)
 lock = threading.Lock()
 
-# Feishu API Client
+# Feishu API Client & REST Helper
 client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).log_level(lark.LogLevel.INFO).build()
+
+class FeishuAPI:
+    def __init__(self, app_id: str, app_secret: str):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.token = ""
+        self.expire_at = 0
+
+    def get_token(self) -> str:
+        if self.token and time.time() < self.expire_at:
+            return self.token
+        try:
+            res = requests.post(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                json={"app_id": self.app_id, "app_secret": self.app_secret},
+                timeout=5
+            ).json()
+            self.token = res.get("tenant_access_token", "")
+            self.expire_at = time.time() + res.get("expire", 7200) - 300
+        except Exception as e:
+            print(f"[FeishuAPI] get_token failed: {e}")
+        return self.token
+
+    def list_chats(self) -> list:
+        token = self.get_token()
+        if not token:
+            return []
+        try:
+            res = requests.get(
+                "https://open.feishu.cn/open-apis/im/v1/chats?page_size=50",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5
+            ).json()
+            return res.get("data", {}).get("items", []) or []
+        except Exception as e:
+            print(f"[FeishuAPI] list_chats failed: {e}")
+            return []
+
+    def get_chat(self, chat_id: str) -> dict:
+        token = self.get_token()
+        if not token:
+            return {}
+        try:
+            res = requests.get(
+                f"https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5
+            ).json()
+            return res.get("data", {}) or {}
+        except Exception as e:
+            print(f"[FeishuAPI] get_chat({chat_id}) failed: {e}")
+            return {}
+
+    def get_bot_info(self) -> dict:
+        token = self.get_token()
+        if not token:
+            return {}
+        try:
+            res = requests.get(
+                "https://open.feishu.cn/open-apis/bot/v3/info",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5
+            ).json()
+            if res.get("code") == 0:
+                return res.get("bot", {})
+        except Exception as e:
+            print(f"[FeishuAPI] get_bot_info failed: {e}")
+        return {}
+
+feishu_api = FeishuAPI(APP_ID, APP_SECRET)
+
+# Auto-detect BOT_OPEN_ID and BOT_NAME if not explicitly configured
+if not BOT_OPEN_ID:
+    _bot_info = feishu_api.get_bot_info()
+    if _bot_info:
+        BOT_OPEN_ID = _bot_info.get("open_id", "")
+        if not BOT_NAME:
+            BOT_NAME = _bot_info.get("app_name", "")
+
+# ----------------- Chat / Channel Metadata Cache -----------------
+chat_cache: Dict[str, Dict[str, Any]] = {}
+
+def get_chat_info(chat_id: str) -> dict:
+    """Fetches and caches chat metadata (name, mode) from Feishu."""
+    if chat_id in chat_cache:
+        return chat_cache[chat_id]
+    data = feishu_api.get_chat(chat_id)
+    info = {
+        "name": data.get("name", ""),
+        "chat_mode": data.get("chat_mode", "group"),
+        "description": data.get("description", "")
+    }
+    chat_cache[chat_id] = info
+    return info
+
+def sync_all_chats():
+    """Preloads and binds all channels/chats the bot belongs to."""
+    items = feishu_api.list_chats()
+    if items:
+        print(f"[Feishu] 成功同步并检查 {len(items)} 个频道/群聊:")
+        for item in items:
+            cid = item.get("chat_id")
+            cname = item.get("name", "")
+            cmode = item.get("chat_mode", "group")
+            chat_cache[cid] = {
+                "name": cname,
+                "chat_mode": cmode,
+                "description": item.get("description", "")
+            }
+            binding = session_mgr.bind_chat(cid, chat_name=cname, chat_mode=cmode)
+            print(f"  • 🏢 频道【{cname}】 ➔ 📁 项目【{binding['project_name']}】({binding['project_dir']})")
 
 # ----------------- Message Sending -----------------
 def reply_message(message_id: str, content: Any, msg_type: str = "text"):
@@ -61,28 +215,42 @@ def reply_message(message_id: str, content: Any, msg_type: str = "text"):
 
 # ----------------- Command Handlers -----------------
 def cmd_help(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
-    sess = session_mgr.get_session(session_key)
-    conv_title = f"`{sess['conversation_id'][:8]}...`" if sess.get("conversation_id") else "无（等待首条指令）"
-    card = card_builder.build_menu_card(sess["project_name"], sess["project_dir"], conv_title)
+    sess = session_mgr.get_session(session_key, parent_chat_id)
+    conv_title = f"`{sess['conversation_id'][:8]}...`" if sess.get("conversation_id") else "新话题（等待首条指令）"
+    card = card_builder.build_menu_card(
+        project_name=sess["project_name"],
+        project_dir=sess["project_dir"],
+        conv_title=conv_title,
+        channel_name=sess.get("channel_name")
+    )
     reply_message(message_id, card, "interactive")
 
 def cmd_status(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
-    sess = session_mgr.get_session(session_key)
+    sess = session_mgr.get_session(session_key, parent_chat_id)
     recent = "".join([f"\n  • [{h['time']}] {h['prompt']}" for h in sess.get("history", [])[-3:]]) or " 暂无"
+    channel_line = f"• 所属频道: 🏢 {sess.get('channel_name')}\n" if sess.get('channel_name') else ""
+    topic_line = f"• 话题会话: 💬 {sess.get('topic_title')}\n" if sess.get('topic_title') else ""
+
     msg = (
         f"📊 【工作台状态】\n"
-        f"• 会话标识: {session_key}\n"
+        f"{channel_line}"
         f"• 绑定项目: 📁 {sess['project_name']}\n"
         f"• 工作目录: `{sess['project_dir']}`\n"
-        f"• Agent 会话 ID: {sess.get('conversation_id') or '🆕 新会话'}\n"
+        f"{topic_line}"
+        f"• Agent 会话 ID: `{sess.get('conversation_id') or '🆕 新会话'}`\n"
+        f"• 对话轮次: {len(sess.get('history', []))} 轮\n"
         f"• 最近任务记录:{recent}"
     )
     reply_message(message_id, msg)
 
 def cmd_projects(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
     projs = session_mgr.list_projects()
-    sess = session_mgr.get_session(session_key)
-    card = card_builder.build_projects_card(sess["project_name"], projs)
+    sess = session_mgr.get_session(session_key, parent_chat_id)
+    card = card_builder.build_projects_card(
+        current_project=sess["project_name"],
+        projects=projs,
+        channel_name=sess.get("channel_name")
+    )
     reply_message(message_id, card, "interactive")
 
 def cmd_project(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
@@ -91,11 +259,15 @@ def cmd_project(session_key: str, message_id: str, parts: list, parent_chat_id: 
         return
     proj_name = parts[1]
     sess = session_mgr.set_project(session_key, proj_name, parent_chat_id)
-    reply_message(message_id, f"✅ 已成功切换到项目【📁 {sess['project_name']}】！\n工作目录: `{sess['project_dir']}`\n（上一会话已归档，已开启新上下文）")
+    if parent_chat_id:
+        ch_name = sess.get("channel_name") or "当前频道"
+        reply_message(message_id, f"✅ 已成功将频道【🏢 {ch_name}】绑定至项目【📁 {sess['project_name']}】！\n📂 本地工作目录: `{sess['project_dir']}`\n💡 本频道后续新建的所有话题均将在此项目目录下执行。")
+    else:
+        reply_message(message_id, f"✅ 已成功切换到项目【📁 {sess['project_name']}】！\n📂 工作区目录: `{sess['project_dir']}`\n（上一会话已归档，已开启新上下文）")
 
 def cmd_history(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
     histories = session_mgr.get_history_list(session_key, limit=8)
-    sess = session_mgr.get_session(session_key)
+    sess = session_mgr.get_session(session_key, parent_chat_id)
     card = card_builder.build_history_card(sess.get("conversation_id"), histories)
     reply_message(message_id, card, "interactive")
 
@@ -111,7 +283,7 @@ def cmd_switch(session_key: str, message_id: str, parts: list, parent_chat_id: s
 
 def cmd_new(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
     sess = session_mgr.reset_conversation(session_key)
-    reply_message(message_id, f"🔄 已为您开启全新会话！\n当前项目仍为【📁 {sess['project_name']}】，上一会话已自动归档至 `/history`。")
+    reply_message(message_id, f"🔄 已在当前话题内开启全新会话！\n当前项目仍为【📁 {sess['project_name']}】，上一会话已自动归档至 `/history`。")
 
 # Command Dispatch Map
 COMMANDS = {
@@ -193,8 +365,22 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             return
 
         # Topic Groups vs Private Chats
-        parent_chat_id = chat_id if chat_type == "group" else None
-        session_key = f"topic:{chat_id}:{msg.root_id or msg_id}" if chat_type == "group" else chat_id
+        if chat_type == "group":
+            parent_chat_id = chat_id
+            chat_info = get_chat_info(chat_id)
+            topic_id = msg.root_id if msg.root_id else msg_id
+            session_key = f"topic:{chat_id}:{topic_id}"
+            session_mgr.get_topic_session(
+                chat_id=chat_id,
+                topic_id=topic_id,
+                chat_name=chat_info.get("name", ""),
+                chat_mode=chat_info.get("chat_mode", "topic"),
+                first_prompt=clean_text
+            )
+        else:
+            parent_chat_id = None
+            session_key = chat_id
+            session_mgr.get_session(session_key)
 
         parts = clean_text.split()
         cmd = parts[0].lower() if parts else ""
@@ -211,9 +397,17 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 # ----------------- Main Entrypoint -----------------
 def main():
     print("=" * 60)
-    print("🚀 Antigravity 飞书全能网关 (Feishu Agent Gateway v4.0 - 精炼优化版)")
+    print(f"🚀 Antigravity 飞书全能网关 (Feishu Agent Gateway v4.6 - 多实例/多租户支持版)")
+    print(f"• 实例标识: [{tag}]")
+    print(f"• 机器人: {BOT_NAME or 'Feishu Bot'} (Open ID: {BOT_OPEN_ID or '自动识别'})")
     print(f"• App ID: {APP_ID} | 工作区根目录: {DEFAULT_ROOT}")
+    print(f"• 配置文件: {CONFIG_PATH}")
+    print(f"• 会话存储: {SESSIONS_PATH}")
+    print(f"• 频道映射: {BINDINGS_PATH}")
     print("=" * 60)
+
+    # Sync and auto-bind all current channels to local projects
+    sync_all_chats()
 
     handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message_received).build()
     ws_client = lark.ws.Client(app_id=APP_ID, app_secret=APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)

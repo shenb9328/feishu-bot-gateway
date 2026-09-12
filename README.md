@@ -14,6 +14,8 @@
 ## 🌟 核心特性
 
 - ⚡ **零公网依赖**：采用官方 WebSocket 长连接模式，任何处于内网、云开发机或私有 VPS 的主机均可秒级接入，彻底告别域名、SSL 证书与反向代理。
+- 🤖 **单内核并发多租户 / 多机器人**：支持 1 个 Antigravity 智能体（agy）同时链接 \(n\) 个不同飞书企业/个人账户下的 \(m\) 个机器人，多实例进程级隔离、会话与存储天然物理独立。
+- 🔍 **零配置机器人自动探测**：启动时自动调用飞书官方 OpenAPI 获取机器人名称与 Open ID，告别繁杂的硬编码配置。
 - 📁 **多项目工作区隔离**：自动扫描主目录与工作区项目（如 `飞书`、`腾讯云` 等），使用 `/project <名>` 即可秒级切换工作目录。
 - 🌳 **飞书话题群（Topic Group）1:1 映射**：
   - **群组** = 本地项目（Project / Workspace）
@@ -22,7 +24,7 @@
 - 💬 **彻底免 @ 直接交互**：群内无需每次艾特机器人，像与真人聊天一样直接打字发回车，机器人秒级响应。
 - 📜 **多轮会话回溯管理**：内置 `/new`（开新会话）、`/history`（历史清单）与 `/switch <序号>`（一秒切回），随时承接不同上下文。
 - 🎨 **飞书原生富文本卡片**：状态面板、项目列表、历史会话全以交互卡片形式精致展现。
-- 🛡️ **开机与崩溃自愈守护**：通过 Linux Systemd 用户级服务托管，配置 Linger 免登录自启，服务永久在线。
+- 🛡️ **开机与崩溃自愈守护**：通过 Linux Systemd 模板服务托管，配置 Linger 免登录自启，服务永久在线。
 
 ---
 
@@ -30,28 +32,32 @@
 
 ```mermaid
 flowchart LR
-    subgraph 移动端 / 电脑端
-        User[你（飞书客户端）]
+    subgraph 飞书多租户平台
+        Bot1[账户 A: 研发助手]
+        Bot2[账户 B: 运维助手]
     end
 
-    subgraph 飞书开放平台
-        LarkCloud[飞书消息网关]
+    subgraph 网关服务集群 [Linux 守护进程]
+        GW1[feishu-agent 默认实例]
+        GW2[feishu-agent@bot2 实例]
     end
 
-    subgraph 本地 / 服务器运行环境
-        Gateway[feishu-agent 网关服务\n(WebSocket 消息中继)]
-        Engine[Antigravity Agent 核心\n(agy CLI / 执行引擎)]
-        FS[本地工作区 & 工具链\n(Bash / Python / 文件系统)]
+    subgraph 本地核心引擎 [Antigravity Core]
+        Agy[统一 Antigravity Agent 内核\n(/usr/local/bin/agy)]
+        Workspaces[隔离项目工作区 / Linux 环境]
     end
 
-    User -->|发送指令| LarkCloud
-    LarkCloud ==WebSocket 长连接==> Gateway
-    Gateway -->|按会话上下文调度| Engine
-    Engine -->|读写文件 / 运行命令| FS
-    FS -->|执行结果| Engine
-    Engine -->|产出回复| Gateway
-    Gateway ==推送卡片/消息==> LarkCloud
-    LarkCloud --> User
+    Bot1 ==WebSocket 长连接==> GW1
+    Bot2 ==WebSocket 长连接==> GW2
+
+    GW1 -->|并发上下文调度| Agy
+    GW2 -->|并发上下文调度| Agy
+
+    Agy <--> Workspaces
+    Agy -->|执行输出| GW1
+    Agy -->|执行输出| GW2
+    GW1 ==推送信令/卡片==> Bot1
+    GW2 ==推送信令/卡片==> Bot2
 ```
 
 ---
@@ -116,7 +122,7 @@ chmod +x install.sh
 服务由 Linux 用户级 Systemd 托管：
 
 ```bash
-# 查看运行状态
+# 查看默认实例运行状态
 systemctl --user status feishu-agent
 
 # 查看实时日志
@@ -128,6 +134,40 @@ systemctl --user restart feishu-agent
 # 停止服务
 systemctl --user stop feishu-agent
 ```
+
+---
+
+## 🤖 多租户与多机器人多开指南 (1个 agy 驱动多个机器人)
+
+如果你有多个飞书租户（不同企业或个人账号），或者需要在同一台服务器上运行多个不同用途的飞书机器人（如：`研发助手`、`运维助手`、`客服测试`），只需利用内置的 **Systemd 模板服务**，无需重复安装：
+
+### 1. 创建新机器人的配置文件
+在项目目录下复制模板（如新机器人代号为 `ops`）：
+```bash
+cp config.example.json config.ops.json
+```
+编辑 `config.ops.json` 填入新机器人的 `app_id` 与 `app_secret`：
+```json
+{
+  "app_id": "cli_xxxxxxxxxxxxxxxx",
+  "app_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "bot_name": "运维助手",
+  "projects_root": "/home/shenb9328_gmail_com",
+  "allowed_open_ids": []
+}
+```
+
+### 2. 一键启动并托管新实例
+```bash
+# 启动并设置开机自启 (实例名与 config.<实例名>.json 一一对应)
+systemctl --user enable --now feishu-agent@ops
+
+# 查看该机器人状态与日志
+systemctl --user status feishu-agent@ops
+journalctl --user -u feishu-agent@ops -f
+```
+
+各机器人的会话数据将自动隔离存入 `sessions.ops.json` 与 `chat_bindings.ops.json`，独立管理，互不干扰！
 
 ---
 
