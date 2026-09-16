@@ -296,6 +296,68 @@ COMMANDS = {
     "/new": cmd_new, "new": cmd_new, "/clear": cmd_new, "clear": cmd_new, "新建会话": cmd_new,
 }
 
+# ----------------- FastPath Paipan Execution -----------------
+PAIPAN_CACHE_FILE = os.path.join(BASE_DIR, "latest_paipan.json")
+
+def load_paipan_cache():
+    if os.path.exists(PAIPAN_CACHE_FILE):
+        try:
+            with open(PAIPAN_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_paipan_cache(cache):
+    try:
+        with open(PAIPAN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def parse_paipan_args(clean_text: str):
+    text = re.sub(r'^[/\s]*(排盘|起盘|算卦)[，,\s]*', '', clean_text).strip()
+    text = re.sub(r'(现在时刻|当前时刻|现在|当前)[，,\s]*', '', text).strip()
+    tokens = [t.strip() for t in re.split(r'[，,]+', text) if t.strip()]
+    city = '杭州'
+    time_str = ''
+    
+    if len(tokens) <= 1 and tokens:
+        tokens = [t.strip() for t in tokens[0].split() if t.strip()]
+        
+    for tok in tokens:
+        if re.search(r'\d{4}[-/年]\d{1,2}', tok) or re.search(r'\d{1,2}:\d{2}', tok):
+            time_str = (time_str + ' ' + tok).strip()
+        elif tok:
+            city = tok
+            
+    cmd = ["/home/shenb9328_gmail_com/.gemini/antigravity-cli/bin/mingli", "-f", "markdown", "-c", city]
+    if time_str:
+        cmd.append(time_str)
+    return city, time_str, cmd
+
+def cmd_paipan(session_key: str, message_id: str, clean_text: str):
+    """0.1秒极速排盘直通通道"""
+    city, time_str, cmd = parse_paipan_args(clean_text)
+    print(f"[FastPath Paipan] Executing mingli: city={city}, time={time_str}")
+    start_t = time.time()
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        elapsed = round(time.time() - start_t, 2)
+        if res.returncode == 0 and res.stdout.strip():
+            output = res.stdout.strip()
+            # 缓存本次排盘结果，供后续'解读'直接使用
+            cache = load_paipan_cache()
+            cache[session_key] = output
+            save_paipan_cache(cache)
+            reply_message(message_id, output)
+            print(f"[FastPath Paipan] Done in {elapsed}s")
+        else:
+            err = res.stderr.strip() or "未知错误"
+            reply_message(message_id, f"❌ 排盘异常: {err}")
+    except Exception as e:
+        reply_message(message_id, f"⚠️ 排盘运行出错: {str(e)}")
+
 # ----------------- Agent Task Execution -----------------
 def execute_agent_task(session_key: str, message_id: str, prompt: str):
     """Executes prompt via agy CLI and returns response."""
@@ -303,7 +365,15 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str):
     project_dir = sess["project_dir"]
     conv_id = sess.get("conversation_id")
 
-    cmd = ["/usr/local/bin/agy", "-p", prompt, "--output-format", "json", "--dangerously-skip-permissions"]
+    # 如果用户请求解读，自动注入最近一次排盘结果
+    cache = load_paipan_cache()
+    if any(k in prompt for k in ["解读", "分析", "看盘", "看下盘"]) and session_key in cache:
+        chart = cache[session_key]
+        actual_prompt = f"【最近排盘数据】:\n{chart}\n\n【用户指令】: {prompt}\n\n请严格遵循易理准则进行专业深入解读：排盘中的八字为起盘占断时刻天时干支，非生辰八字。请结合梅花易数体用生克、奇门遁甲星门吉凶格局、小六壬给出专业深入分析与落地谋断建议。"
+    else:
+        actual_prompt = prompt
+
+    cmd = ["/usr/local/bin/agy", "-p", actual_prompt, "--output-format", "json", "--dangerously-skip-permissions"]
     if conv_id:
         cmd.extend(["--conversation", conv_id])
 
@@ -386,7 +456,9 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         cmd = parts[0].lower() if parts else ""
 
         # Route Command or Dispatch Agent Task
-        if cmd in COMMANDS:
+        if clean_text.startswith("排盘") or clean_text.startswith("/排盘") or clean_text.startswith("起盘") or clean_text.startswith("/起盘") or cmd in ["paipan", "/paipan"]:
+            cmd_paipan(session_key, msg_id, clean_text)
+        elif cmd in COMMANDS:
             COMMANDS[cmd](session_key, msg_id, parts, parent_chat_id)
         else:
             executor.submit(execute_agent_task, session_key, msg_id, clean_text)
