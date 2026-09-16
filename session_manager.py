@@ -315,6 +315,16 @@ class SessionManager:
             return target_conv
         return None
 
+    def set_model(self, session_key: str, model_name: Optional[str] = None) -> str:
+        sess = self.get_session(session_key)
+        if model_name:
+            sess["model"] = model_name
+        else:
+            sess.pop("model", None)
+        sess["updated_at"] = time.time()
+        self._save()
+        return sess.get("model", "")
+
     def list_projects(self) -> List[str]:
         projects = ["default"]
         projects.extend(self.list_available_workspaces())

@@ -68,9 +68,79 @@ else:
 APP_ID = config["app_id"]
 APP_SECRET = config["app_secret"]
 DEFAULT_ROOT = config.get("projects_root", os.path.expanduser("~/.gemini/antigravity-cli/scratch"))
+DEFAULT_MODEL = config.get("default_model", "gemini-3.8-flash-medium")
 ALLOWED_OPEN_IDS = set(config.get("allowed_open_ids", []))
 BOT_OPEN_ID = config.get("bot_open_id", "")
 BOT_NAME = config.get("bot_name", "")
+
+# Model Aliases & Override Matching
+MODEL_ALIASES = {
+    # Flash 系列
+    "flash": "gemini-3.8-flash-medium",
+    "flash-medium": "gemini-3.8-flash-medium",
+    "flash-high": "gemini-3.8-flash-high",
+    "flash-low": "gemini-3.8-flash-low",
+    "flashmedium": "gemini-3.8-flash-medium",
+    "flashhigh": "gemini-3.8-flash-high",
+    "flashlow": "gemini-3.8-flash-low",
+    "gemini-3.8-flash-medium": "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-high": "gemini-3.8-flash-high",
+    "gemini-3.8-flash-low": "gemini-3.8-flash-low",
+    "gemini-3.7-flash-medium": "gemini-3.7-flash-medium",
+    "gemini-3.7-flash-high": "gemini-3.7-flash-high",
+    "gemini-3.7-flash-low": "gemini-3.7-flash-low",
+
+    # 思考档次别名
+    "medium": "gemini-3.8-flash-medium",
+    "中档": "gemini-3.8-flash-medium",
+    "high": "gemini-3.8-flash-high",
+    "高档": "gemini-3.8-flash-high",
+    "深度思考": "gemini-3.8-flash-high",
+    "low": "gemini-3.8-flash-low",
+    "低档": "gemini-3.8-flash-low",
+    "极速": "gemini-3.8-flash-low",
+
+    # Pro 旗舰系列
+    "pro": "gemini-3.1-pro-high",
+    "pro-high": "gemini-3.1-pro-high",
+    "pro-low": "gemini-3.1-pro-low",
+    "gemini-3.1-pro-high": "gemini-3.1-pro-high",
+    "gemini-3.1-pro-low": "gemini-3.1-pro-low",
+
+    # Claude 系列
+    "claude": "claude-sonnet-4-6",
+    "sonnet": "claude-sonnet-4-6",
+    "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6-thinking",
+    "claude-opus-4-6-thinking": "claude-opus-4-6-thinking",
+
+    # 开源 / 其他
+    "gpt": "gpt-oss-120b-medium",
+    "gpt-oss-120b-medium": "gpt-oss-120b-medium",
+}
+
+def extract_model_override(prompt: str):
+    """Extracts explicit or natural language model override from prompt. Returns (model_id or None, cleaned_prompt)."""
+    # 1. CLI flag: --model <name> or -m <name>
+    flag_match = re.search(r'(?:--model|-m)\s+([a-zA-Z0-9_.-]+)', prompt)
+    if flag_match:
+        m_str = flag_match.group(1).lower()
+        if m_str in MODEL_ALIASES:
+            cleaned = re.sub(r'(?:--model|-m)\s+([a-zA-Z0-9_.-]+)', '', prompt).strip()
+            return MODEL_ALIASES[m_str], cleaned
+
+    # 2. Natural language pattern: "用pro模型...", "使用claude sonnet回答...", "用高档思考..."
+    nl_match = re.match(r'^(?:请?用|使用|换用|采用|调用)\s*([a-zA-Z0-9_\u4e00-\u9fa5\.-]+?)\s*(?:模型|回答|执行|推演|思考)?\s*[:：,，\s]\s*(.*)$', prompt, re.DOTALL)
+    if nl_match:
+        cand = nl_match.group(1).strip().lower()
+        rest = nl_match.group(2).strip()
+        if cand in MODEL_ALIASES:
+            return MODEL_ALIASES[cand], rest
+        for alias, target in MODEL_ALIASES.items():
+            if alias in cand:
+                return target, rest
+
+    return None, prompt
 
 session_mgr = SessionManager(SESSIONS_PATH, DEFAULT_ROOT, BINDINGS_PATH)
 executor = ThreadPoolExecutor(max_workers=5)
@@ -227,6 +297,7 @@ def cmd_help(session_key: str, message_id: str, parts: list, parent_chat_id: str
 
 def cmd_status(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
     sess = session_mgr.get_session(session_key, parent_chat_id)
+    cur_model = sess.get("model") or DEFAULT_MODEL
     recent = "".join([f"\n  • [{h['time']}] {h['prompt']}" for h in sess.get("history", [])[-3:]]) or " 暂无"
     channel_line = f"• 所属频道: 🏢 {sess.get('channel_name')}\n" if sess.get('channel_name') else ""
     topic_line = f"• 话题会话: 💬 {sess.get('topic_title')}\n" if sess.get('topic_title') else ""
@@ -236,12 +307,55 @@ def cmd_status(session_key: str, message_id: str, parts: list, parent_chat_id: s
         f"{channel_line}"
         f"• 绑定项目: 📁 {sess['project_name']}\n"
         f"• 工作目录: `{sess['project_dir']}`\n"
+        f"• 运行模型: ⚡ `{cur_model}`\n"
         f"{topic_line}"
         f"• Agent 会话 ID: `{sess.get('conversation_id') or '🆕 新会话'}`\n"
         f"• 对话轮次: {len(sess.get('history', []))} 轮\n"
         f"• 最近任务记录:{recent}"
     )
     reply_message(message_id, msg)
+
+def cmd_model(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
+    sess = session_mgr.get_session(session_key, parent_chat_id)
+    cur_model = sess.get("model") or DEFAULT_MODEL
+
+    if len(parts) < 2 or parts[1].lower() in ["list", "show", "status", "ls"]:
+        msg = (
+            f"🤖 【模型配置状态】\n"
+            f"• 当前生效模型: ⚡ `{cur_model}`\n"
+            f"• 全局默认模型: `{DEFAULT_MODEL}` (Flash Medium)\n\n"
+            f"📌 【支持的快捷切换】\n"
+            f"1. 切换本话题模型：\n"
+            f"   • `/model pro` ➔ Gemini 3.1 Pro (High)\n"
+            f"   • `/model high` ➔ Gemini 3.8 Flash (High 深度思考)\n"
+            f"   • `/model sonnet` ➔ Claude Sonnet 4.6\n"
+            f"   • `/model opus` ➔ Claude Opus 4.6 (Thinking)\n"
+            f"   • `/model reset` ➔ 恢复全局默认 (Flash Medium)\n\n"
+            f"2. 单次提问临时指定（无需切换）：\n"
+            f"   • “用pro模型 帮我优化这个算法”\n"
+            f"   • “--model sonnet 请设计该系统架构”"
+        )
+        reply_message(message_id, msg)
+        return
+
+    arg = parts[1].lower().strip()
+    if arg in ["reset", "default", "默认", "恢复"]:
+        session_mgr.set_model(session_key, None)
+        reply_message(message_id, f"✅ 已恢复为全局默认模型：`{DEFAULT_MODEL}`")
+        return
+
+    matched_model = MODEL_ALIASES.get(arg)
+    if not matched_model:
+        for k, v in MODEL_ALIASES.items():
+            if k in arg:
+                matched_model = v
+                break
+
+    if matched_model:
+        session_mgr.set_model(session_key, matched_model)
+        reply_message(message_id, f"✅ 成功将当前话题模型切换为：`{matched_model}`！\n后续在此话题下的对话将默认使用该模型。")
+    else:
+        reply_message(message_id, f"❌ 未知模型「{parts[1]}」。可用选项：`flash-medium`、`flash-high`、`pro`、`sonnet`、`opus`、`reset`。")
 
 def cmd_projects(session_key: str, message_id: str, parts: list, parent_chat_id: str = None):
     projs = session_mgr.list_projects()
@@ -289,6 +403,7 @@ def cmd_new(session_key: str, message_id: str, parts: list, parent_chat_id: str 
 COMMANDS = {
     "/help": cmd_help, "help": cmd_help, "帮助": cmd_help, "/menu": cmd_help, "menu": cmd_help, "/card": cmd_help,
     "/status": cmd_status, "status": cmd_status, "状态": cmd_status, "/状态": cmd_status,
+    "/model": cmd_model, "model": cmd_model, "/模型": cmd_model, "模型": cmd_model,
     "/projects": cmd_projects, "projects": cmd_projects, "/项目": cmd_projects, "项目": cmd_projects,
     "/project": cmd_project, "project": cmd_project, "切项目": cmd_project,
     "/history": cmd_history, "history": cmd_history, "/历史": cmd_history, "历史": cmd_history,
@@ -380,9 +495,13 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
     project_dir = sess["project_dir"]
     conv_id = sess.get("conversation_id")
 
+    # 模型选择判定：单次提问特别指定 > 话题绑定模型 > 全局默认 (DEFAULT_MODEL: gemini-3.8-flash-medium)
+    override_model, clean_prompt = extract_model_override(prompt)
+    target_model = override_model or sess.get("model") or DEFAULT_MODEL
+
     # 如果用户请求解读，自动注入最近一次排盘结果（支持本话题、本群聊、全局最新三级继承）
     cache = load_paipan_cache()
-    is_interpret = any(k in prompt for k in ["解读", "分析", "看盘", "看下盘", "占断", "断卦", "测", "算"])
+    is_interpret = any(k in clean_prompt for k in ["解读", "分析", "看盘", "看下盘", "占断", "断卦", "测", "算"])
     chart = None
     if is_interpret:
         chart = cache.get(session_key) or (cache.get(parent_chat_id) if parent_chat_id else None) or cache.get("_latest_")
@@ -390,20 +509,27 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
     if chart and is_interpret:
         actual_prompt = (
             f"【待解读排盘数据】:\n{chart}\n\n"
-            f"【用户诉求】: {prompt}\n\n"
+            f"【用户诉求】: {clean_prompt}\n\n"
             f"【系统严格指引】:\n"
             f"1. 绝不要调用任何工具（严禁 run_command、view_file、grep 等），严禁在硬盘查找文件！\n"
             f"2. 请直接基于上述排盘数据进行专业易理推演：排盘中的八字为起盘占断时刻天时干支，非生辰八字。\n"
             f"3. 紧密结合梅花易数体用生克、奇门遁甲星门神仪格局吉凶、小六壬落宫断语，直接输出条理清晰、专业深刻的解读与决策建议。"
         )
     else:
-        actual_prompt = prompt
+        actual_prompt = clean_prompt
 
-    cmd = ["/usr/local/bin/agy", "-p", actual_prompt, "--output-format", "json", "--dangerously-skip-permissions"]
+    cmd = [
+        "/usr/local/bin/agy",
+        "-p", actual_prompt,
+        "--model", target_model,
+        "--output-format", "json",
+        "--dangerously-skip-permissions"
+    ]
     if conv_id:
         cmd.extend(["--conversation", conv_id])
 
-    print(f"[Agent] Running in {project_dir} [{conv_id or 'NEW'}]: {prompt[:50]}...")
+    model_tag = f" [特别说明: {override_model}]" if override_model else ""
+    print(f"[Agent] Running in {project_dir} [{conv_id or 'NEW'}] (Model: {target_model}{model_tag}): {clean_prompt[:50]}...")
     start_t = time.time()
     try:
         proc = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
@@ -499,6 +625,7 @@ def main():
     print(f"• 实例标识: [{tag}]")
     print(f"• 机器人: {BOT_NAME or 'Feishu Bot'} (Open ID: {BOT_OPEN_ID or '自动识别'})")
     print(f"• App ID: {APP_ID} | 工作区根目录: {DEFAULT_ROOT}")
+    print(f"• 默认模型: {DEFAULT_MODEL} (Flash Medium)")
     print(f"• 配置文件: {CONFIG_PATH}")
     print(f"• 会话存储: {SESSIONS_PATH}")
     print(f"• 频道映射: {BINDINGS_PATH}")

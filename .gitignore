@@ -11,6 +11,7 @@ sessions.json
 sessions.*.json
 chat_bindings*.json
 topic_projects.json
+latest_paipan.json
 *.log
 
 # Python cache and environments
