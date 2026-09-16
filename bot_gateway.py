@@ -336,7 +336,7 @@ def parse_paipan_args(clean_text: str):
         cmd.append(time_str)
     return city, time_str, cmd
 
-def cmd_paipan(session_key: str, message_id: str, clean_text: str):
+def cmd_paipan(session_key: str, message_id: str, clean_text: str, parent_chat_id: str = None):
     """0.1秒极速排盘直通通道"""
     city, time_str, cmd = parse_paipan_args(clean_text)
     print(f"[FastPath Paipan] Executing mingli: city={city}, time={time_str}")
@@ -346,9 +346,12 @@ def cmd_paipan(session_key: str, message_id: str, clean_text: str):
         elapsed = round(time.time() - start_t, 2)
         if res.returncode == 0 and res.stdout.strip():
             output = res.stdout.strip()
-            # 缓存本次排盘结果，供后续'解读'直接使用
+            # 缓存本次排盘结果（多层级关联，供后续跨话题'解读'秒级直接调取）
             cache = load_paipan_cache()
             cache[session_key] = output
+            if parent_chat_id:
+                cache[parent_chat_id] = output
+            cache["_latest_"] = output
             save_paipan_cache(cache)
             reply_message(message_id, output)
             print(f"[FastPath Paipan] Done in {elapsed}s")
@@ -359,17 +362,28 @@ def cmd_paipan(session_key: str, message_id: str, clean_text: str):
         reply_message(message_id, f"⚠️ 排盘运行出错: {str(e)}")
 
 # ----------------- Agent Task Execution -----------------
-def execute_agent_task(session_key: str, message_id: str, prompt: str):
+def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_chat_id: str = None):
     """Executes prompt via agy CLI and returns response."""
     sess = session_mgr.get_session(session_key)
     project_dir = sess["project_dir"]
     conv_id = sess.get("conversation_id")
 
-    # 如果用户请求解读，自动注入最近一次排盘结果
+    # 如果用户请求解读，自动注入最近一次排盘结果（支持本话题、本群聊、全局最新三级继承）
     cache = load_paipan_cache()
-    if any(k in prompt for k in ["解读", "分析", "看盘", "看下盘"]) and session_key in cache:
-        chart = cache[session_key]
-        actual_prompt = f"【最近排盘数据】:\n{chart}\n\n【用户指令】: {prompt}\n\n请严格遵循易理准则进行专业深入解读：排盘中的八字为起盘占断时刻天时干支，非生辰八字。请结合梅花易数体用生克、奇门遁甲星门吉凶格局、小六壬给出专业深入分析与落地谋断建议。"
+    is_interpret = any(k in prompt for k in ["解读", "分析", "看盘", "看下盘", "占断", "断卦", "测", "算"])
+    chart = None
+    if is_interpret:
+        chart = cache.get(session_key) or (cache.get(parent_chat_id) if parent_chat_id else None) or cache.get("_latest_")
+
+    if chart and is_interpret:
+        actual_prompt = (
+            f"【待解读排盘数据】:\n{chart}\n\n"
+            f"【用户诉求】: {prompt}\n\n"
+            f"【系统严格指引】:\n"
+            f"1. 绝不要调用任何工具（严禁 run_command、view_file、grep 等），严禁在硬盘查找文件！\n"
+            f"2. 请直接基于上述排盘数据进行专业易理推演：排盘中的八字为起盘占断时刻天时干支，非生辰八字。\n"
+            f"3. 紧密结合梅花易数体用生克、奇门遁甲星门神仪格局吉凶、小六壬落宫断语，直接输出条理清晰、专业深刻的解读与决策建议。"
+        )
     else:
         actual_prompt = prompt
 
@@ -457,11 +471,11 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
         # Route Command or Dispatch Agent Task
         if clean_text.startswith("排盘") or clean_text.startswith("/排盘") or clean_text.startswith("起盘") or clean_text.startswith("/起盘") or cmd in ["paipan", "/paipan"]:
-            cmd_paipan(session_key, msg_id, clean_text)
+            cmd_paipan(session_key, msg_id, clean_text, parent_chat_id)
         elif cmd in COMMANDS:
             COMMANDS[cmd](session_key, msg_id, parts, parent_chat_id)
         else:
-            executor.submit(execute_agent_task, session_key, msg_id, clean_text)
+            executor.submit(execute_agent_task, session_key, msg_id, clean_text, parent_chat_id)
 
     except Exception as e:
         print(f"[Feishu Error] {e}")
