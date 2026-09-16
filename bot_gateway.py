@@ -315,20 +315,27 @@ def save_paipan_cache(cache):
     except Exception:
         pass
 
+INTERPRET_KEYWORDS = [
+    "解读", "分析", "看下", "看一下", "帮看", "断卦", "占断", "测算", 
+    "运势", "财运", "事业", "婚姻", "健康", "能不能", "如何", "怎样", "好不好", "吉凶"
+]
+
+def should_also_interpret(clean_text: str) -> bool:
+    return any(k in clean_text for k in INTERPRET_KEYWORDS)
+
 def parse_paipan_args(clean_text: str):
     text = re.sub(r'^[/\s]*(排盘|起盘|算卦)[，,\s]*', '', clean_text).strip()
     text = re.sub(r'(现在时刻|当前时刻|现在|当前)[，,\s]*', '', text).strip()
-    tokens = [t.strip() for t in re.split(r'[，,]+', text) if t.strip()]
+    # 剥离并/并且/顺便/帮我/解读/分析等修饰词，避免误当成城市名称
+    clean_city_text = re.sub(r'(并且|并|顺便|帮我|请|进行|给|做|来个)?[，,\s]*(解读|分析|看下|看一下|断卦|占断|测算|运势|财运|事业|婚姻|健康|如何|怎样|吉凶).*$', '', text).strip()
+    tokens = [t.strip() for t in re.split(r'[，,\s]+', clean_city_text) if t.strip()]
     city = '杭州'
     time_str = ''
     
-    if len(tokens) <= 1 and tokens:
-        tokens = [t.strip() for t in tokens[0].split() if t.strip()]
-        
     for tok in tokens:
         if re.search(r'\d{4}[-/年]\d{1,2}', tok) or re.search(r'\d{1,2}:\d{2}', tok):
             time_str = (time_str + ' ' + tok).strip()
-        elif tok:
+        elif tok and tok not in ["并且", "并", "顺便", "解读", "分析", "和", "跟"]:
             city = tok
             
     cmd = ["/home/shenb9328_gmail_com/.gemini/antigravity-cli/bin/mingli", "-f", "markdown", "-c", city]
@@ -337,7 +344,7 @@ def parse_paipan_args(clean_text: str):
     return city, time_str, cmd
 
 def cmd_paipan(session_key: str, message_id: str, clean_text: str, parent_chat_id: str = None):
-    """0.1秒极速排盘直通通道"""
+    """0.1秒极速排盘直通通道（支持排盘+解读连发）"""
     city, time_str, cmd = parse_paipan_args(clean_text)
     print(f"[FastPath Paipan] Executing mingli: city={city}, time={time_str}")
     start_t = time.time()
@@ -355,6 +362,11 @@ def cmd_paipan(session_key: str, message_id: str, clean_text: str, parent_chat_i
             save_paipan_cache(cache)
             reply_message(message_id, output)
             print(f"[FastPath Paipan] Done in {elapsed}s")
+
+            # 若用户在同一句话中要求"并且解读/分析"，自动触发 Agent 解读
+            if should_also_interpret(clean_text):
+                print(f"[FastPath Paipan] Auto-triggering interpretation for: {clean_text}")
+                executor.submit(execute_agent_task, session_key, message_id, clean_text, parent_chat_id)
         else:
             err = res.stderr.strip() or "未知错误"
             reply_message(message_id, f"❌ 排盘异常: {err}")
