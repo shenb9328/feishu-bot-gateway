@@ -4,6 +4,7 @@ import re
 import sys
 import json
 import time
+import datetime
 import requests
 import subprocess
 import threading
@@ -435,8 +436,61 @@ INTERPRET_KEYWORDS = [
     "运势", "财运", "事业", "婚姻", "健康", "能不能", "如何", "怎样", "好不好", "吉凶"
 ]
 
+COMPLEX_TIME_WORDS = [
+    "明天", "后天", "大后天", "昨天", "前天", "下周", "这周", "本周", "上周", 
+    "农历", "阴历", "中秋", "端午", "春节", "除夕", "清明", "重阳", "元宵", "冬至", "夏至",
+    "子时", "丑时", "寅时", "卯时", "辰时", "巳时", "午时", "未时", "申时", "酉时", "戌时", "亥时",
+    "半夜", "上午", "下午", "中午", "傍晚", "晚上", "早晨", "早上", "小时后", "天后"
+]
+
 def should_also_interpret(clean_text: str) -> bool:
     return any(k in clean_text for k in INTERPRET_KEYWORDS)
+
+def needs_ai_parsing(clean_text: str) -> bool:
+    """判断是否包含相对时间、节气或口语化历法，需要借助 AI 智能换算"""
+    return any(w in clean_text for w in COMPLEX_TIME_WORDS)
+
+def ai_parse_paipan_args(clean_text: str):
+    """
+    通过本地最快模型 gemini-3-flash 秒级提取结构化排盘参数
+    """
+    now_bj = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    payload = {
+        "model": "gemini-3-flash",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是一个极速命理排盘参数抽取器。请根据用户输入提取以下字段：\n"
+                    "1. city: 测算城市名称（若用户未提及，填空字符串\"\"; 若有别名如帝都请转为标准城市如北京）\n"
+                    "2. time: 公历标准时间字符串（格式必须为 YYYY-MM-DD HH:MM:SS；若为相对时间如明天、下周或农历节气，必须根据当前基准时间准确推算；若未提及时间，填空字符串\"\"）\n"
+                    "3. need_interpret: 布尔值，用户是否表达了解读、分析、看盘、占断、算运势等诉求\n"
+                    "4. question: 用户的具体占测问题（如财运、合作、婚姻等，无则填空字符串\"\"）\n"
+                    f"当前基准北京时间为: {now_bj}。\n"
+                    "请直接输出严格的纯 JSON 格式，禁止任何额外解释。"
+                )
+            },
+            {"role": "user", "content": clean_text}
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0
+    }
+    try:
+        resp = requests.post("http://127.0.0.1:8877/v1/chat/completions", json=payload, timeout=4)
+        if resp.status_code == 200:
+            raw_content = resp.json()["choices"][0]["message"]["content"].strip()
+            if raw_content.startswith("```"):
+                raw_content = re.sub(r"^```(?:json)?\s*", "", raw_content)
+                raw_content = re.sub(r"\s*```$", "", raw_content)
+            parsed = json.loads(raw_content)
+            city = parsed.get("city", "").strip() or "杭州"
+            time_str = parsed.get("time", "").strip()
+            need_interpret = bool(parsed.get("need_interpret", False))
+            question = parsed.get("question", "").strip()
+            return city, time_str, need_interpret, question
+    except Exception as e:
+        print(f"[AI Parse Error] {e}, fallback to regex rules")
+    return None
 
 def parse_paipan_args(clean_text: str):
     text = re.sub(r'^[/\s]*(排盘|起盘|算卦)[，,\s]*', '', clean_text).strip()
@@ -460,8 +514,29 @@ def parse_paipan_args(clean_text: str):
     return city, time_str, cmd
 
 def cmd_paipan(session_key: str, message_id: str, clean_text: str, parent_chat_id: str = None):
-    """0.1秒极速排盘直通通道（支持排盘+解读连发）"""
-    city, time_str, cmd = parse_paipan_args(clean_text)
+    """双轨极速排盘直通通道（日常0.08s直通 + 相对时间AI智能换算）"""
+    city = '杭州'
+    time_str = ''
+    need_interpret = should_also_interpret(clean_text)
+    question = ''
+
+    # 1. 判定是否需要走 AI 辅助解析（包含相对时间或口语化历法）
+    if needs_ai_parsing(clean_text):
+        print(f"[Paipan Route] Detected relative/complex time expression, using AI parser: {clean_text}")
+        ai_res = ai_parse_paipan_args(clean_text)
+        if ai_res:
+            city, time_str, ai_need_interp, question = ai_res
+            need_interpret = need_interpret or ai_need_interp
+        else:
+            city, time_str, _ = parse_paipan_args(clean_text)
+    else:
+        # 2. 常规或明确指令走 0.08 秒极速规则解析
+        city, time_str, _ = parse_paipan_args(clean_text)
+
+    cmd = ["/home/shenb9328_gmail_com/.gemini/antigravity-cli/bin/mingli", "-f", "markdown", "-c", city]
+    if time_str:
+        cmd.append(time_str)
+
     print(f"[FastPath Paipan] Executing mingli: city={city}, time={time_str}")
     start_t = time.time()
     try:
@@ -480,9 +555,12 @@ def cmd_paipan(session_key: str, message_id: str, clean_text: str, parent_chat_i
             print(f"[FastPath Paipan] Done in {elapsed}s")
 
             # 若用户在同一句话中要求"并且解读/分析"，自动触发 Agent 解读
-            if should_also_interpret(clean_text):
-                print(f"[FastPath Paipan] Auto-triggering interpretation for: {clean_text}")
-                executor.submit(execute_agent_task, session_key, message_id, clean_text, parent_chat_id)
+            if need_interpret:
+                interpret_prompt = clean_text
+                if question and question not in interpret_prompt:
+                    interpret_prompt += f"（重点分析：{question}）"
+                print(f"[FastPath Paipan] Auto-triggering interpretation for: {interpret_prompt}")
+                executor.submit(execute_agent_task, session_key, message_id, interpret_prompt, parent_chat_id)
         else:
             err = res.stderr.strip() or "未知错误"
             reply_message(message_id, f"❌ 排盘异常: {err}")
