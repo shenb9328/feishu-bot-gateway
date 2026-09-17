@@ -450,9 +450,15 @@ def needs_ai_parsing(clean_text: str) -> bool:
     """判断是否包含相对时间、节气或口语化历法，需要借助 AI 智能换算"""
     return any(w in clean_text for w in COMPLEX_TIME_WORDS)
 
+PAIPAN_KEYWORDS = ["排盘", "起盘", "起卦", "算卦", "测卦", "排八字", "paipan"]
+
+def is_paipan_command(text: str) -> bool:
+    clean = text.strip().lower()
+    return any(k in clean for k in PAIPAN_KEYWORDS)
+
 def ai_parse_paipan_args(clean_text: str):
     """
-    通过本地最快模型 gemini-3-flash 秒级提取结构化排盘参数
+    通过本地最快模型 gemini-3-flash 秒级提取结构化排盘参数及经度
     """
     now_bj = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     payload = {
@@ -462,10 +468,11 @@ def ai_parse_paipan_args(clean_text: str):
                 "role": "system",
                 "content": (
                     "你是一个极速命理排盘参数抽取器。请根据用户输入提取以下字段：\n"
-                    "1. city: 测算城市名称（若用户未提及，填空字符串\"\"; 若有别名如帝都请转为标准城市如北京）\n"
-                    "2. time: 公历标准时间字符串（格式必须为 YYYY-MM-DD HH:MM:SS；若为相对时间如明天、下周或农历节气，必须根据当前基准时间准确推算；若未提及时间，填空字符串\"\"）\n"
-                    "3. need_interpret: 布尔值，用户是否表达了解读、分析、看盘、占断、算运势等诉求\n"
-                    "4. question: 用户的具体占测问题（如财运、合作、婚姻等，无则填空字符串\"\"）\n"
+                    "1. city: 测算城市或区县名称（若用户未提及，填\"杭州\"；若有别名如帝都请转为标准城市如北京）\n"
+                    "2. longitude: 该地点在中国境内的东经经度浮点数（例如高台县为99.82，乌鲁木齐为87.68，杭州为120.16；若未提及或不确定填空或120.16）\n"
+                    "3. time: 公历标准时间字符串（格式必须为 YYYY-MM-DD HH:MM:SS；若为相对时间如明天、下周或农历节气，必须根据当前基准时间准确推算；若未提及时间，填空字符串\"\"）\n"
+                    "4. need_interpret: 布尔值，用户是否表达了解读、分析、看盘、占断、算运势等诉求\n"
+                    "5. question: 用户的具体占测问题（如财运、合作、婚姻等，无则填空字符串\"\"）\n"
                     f"当前基准北京时间为: {now_bj}。\n"
                     "请直接输出严格的纯 JSON 格式，禁止任何额外解释。"
                 )
@@ -487,14 +494,19 @@ def ai_parse_paipan_args(clean_text: str):
             time_str = parsed.get("time", "").strip()
             need_interpret = bool(parsed.get("need_interpret", False))
             question = parsed.get("question", "").strip()
-            return city, time_str, need_interpret, question
+            longitude = parsed.get("longitude")
+            try:
+                longitude = float(longitude) if longitude else None
+            except (ValueError, TypeError):
+                longitude = None
+            return city, time_str, need_interpret, question, longitude
     except Exception as e:
         print(f"[AI Parse Error] {e}, fallback to regex rules")
     return None
 
 def parse_paipan_args(clean_text: str):
-    text = re.sub(r'^[/\s]*(排盘|起盘|算卦)[，,\s]*', '', clean_text).strip()
-    text = re.sub(r'(现在时刻|当前时刻|现在|当前)[，,\s]*', '', text).strip()
+    text = re.sub(r'[，,\s]*(排盘|起盘|算卦|起卦|测卦)[，,\s]*', ' ', clean_text).strip()
+    text = re.sub(r'(现在时刻|当前时刻|现在|当前)[，,\s]*', ' ', text).strip()
     # 剥离并/并且/顺便/帮我/解读/分析等修饰词，避免误当成城市名称
     clean_city_text = re.sub(r'(并且|并|顺便|帮我|请|进行|给|做|来个)?[，,\s]*(解读|分析|看下|看一下|断卦|占断|测算|运势|财运|事业|婚姻|健康|如何|怎样|吉凶).*$', '', text).strip()
     tokens = [t.strip() for t in re.split(r'[，,\s]+', clean_city_text) if t.strip()]
@@ -514,9 +526,10 @@ def parse_paipan_args(clean_text: str):
     return city, time_str, cmd
 
 def cmd_paipan(session_key: str, message_id: str, clean_text: str, parent_chat_id: str = None):
-    """双轨极速排盘直通通道（日常0.08s直通 + 相对时间AI智能换算）"""
+    """双轨极速排盘直通通道（日常0.08s直通 + 相对时间/区县AI智能换算）"""
     city = '杭州'
     time_str = ''
+    longitude = None
     need_interpret = should_also_interpret(clean_text)
     question = ''
 
@@ -525,7 +538,7 @@ def cmd_paipan(session_key: str, message_id: str, clean_text: str, parent_chat_i
         print(f"[Paipan Route] Detected relative/complex time expression, using AI parser: {clean_text}")
         ai_res = ai_parse_paipan_args(clean_text)
         if ai_res:
-            city, time_str, ai_need_interp, question = ai_res
+            city, time_str, ai_need_interp, question, longitude = ai_res
             need_interpret = need_interpret or ai_need_interp
         else:
             city, time_str, _ = parse_paipan_args(clean_text)
@@ -534,10 +547,12 @@ def cmd_paipan(session_key: str, message_id: str, clean_text: str, parent_chat_i
         city, time_str, _ = parse_paipan_args(clean_text)
 
     cmd = ["/home/shenb9328_gmail_com/.gemini/antigravity-cli/bin/mingli", "-f", "markdown", "-c", city]
+    if longitude:
+        cmd.extend(["--lon", str(longitude)])
     if time_str:
         cmd.append(time_str)
 
-    print(f"[FastPath Paipan] Executing mingli: city={city}, time={time_str}")
+    print(f"[FastPath Paipan] Executing mingli: city={city}, lon={longitude}, time={time_str}")
     start_t = time.time()
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
@@ -687,7 +702,7 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         cmd = parts[0].lower() if parts else ""
 
         # Route Command or Dispatch Agent Task
-        if clean_text.startswith("排盘") or clean_text.startswith("/排盘") or clean_text.startswith("起盘") or clean_text.startswith("/起盘") or cmd in ["paipan", "/paipan"]:
+        if is_paipan_command(clean_text):
             cmd_paipan(session_key, msg_id, clean_text, parent_chat_id)
         elif cmd in COMMANDS:
             COMMANDS[cmd](session_key, msg_id, parts, parent_chat_id)
