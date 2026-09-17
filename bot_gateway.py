@@ -448,9 +448,10 @@ def parse_paipan_args(clean_text: str):
     time_str = ''
     
     for tok in tokens:
-        if re.search(r'\d{4}[-/年]\d{1,2}', tok) or re.search(r'\d{1,2}:\d{2}', tok):
-            time_str = (time_str + ' ' + tok).strip()
-        elif tok and tok not in ["并且", "并", "顺便", "解读", "分析", "和", "跟"]:
+        clean_tok = re.sub(r'^(时间|时刻|日期|公历|阳历)[:：\s]*', '', tok).strip()
+        if re.search(r'\d{4}', clean_tok) or re.search(r'\d{1,2}[点时:]\d{1,2}', clean_tok):
+            time_str = (time_str + ' ' + clean_tok).strip()
+        elif tok and tok not in ["并且", "并", "顺便", "解读", "分析", "和", "跟", "时间", "时刻", "日期"]:
             city = tok
             
     cmd = ["/home/shenb9328_gmail_com/.gemini/antigravity-cli/bin/mingli", "-f", "markdown", "-c", city]
