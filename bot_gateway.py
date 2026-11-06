@@ -1349,11 +1349,25 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
         else:
             actual_prompt = clean_prompt
 
+        clean_title = re.sub(r'[\r\n\t]+', ' ', clean_prompt).strip()
+        display_title = (clean_title[:38] + "...") if len(clean_title) > 38 else clean_title
+
+        # Send initial progress card in millisecond 1
+        init_card = card_builder.build_ai_progress_card(
+            task_title=display_title,
+            status_stage="running",
+            elapsed_seconds=0,
+            step_desc="已建立案卷隔离工作区，正在全案通读在案材料并建立事实脉络...",
+            progress_pct=10,
+            is_legal_bot=IS_LEGAL_BOT
+        )
+        progress_msg_id = reply_message(message_id, init_card, "interactive")
+
         cmd = [
             "/usr/local/bin/agy",
             "-p", actual_prompt,
             "--model", target_model,
-            "--output-format", "json",
+            "--output-format", "stream-json",
             "--dangerously-skip-permissions"
         ]
         if conv_id:
@@ -1362,48 +1376,180 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
         model_tag = f" [特别说明: {override_model}]" if override_model else ""
         print(f"[Agent] Running in {work_dir} [{conv_id or 'NEW'}] (Model: {target_model}{model_tag}): {clean_prompt[:50]}...")
 
-        # Immediate user acknowledgement in Feishu so user has instant feedback
-        if IS_LEGAL_BOT:
-            reply_message(message_id, "⚖️【甘肃乾祐律师事务所】已接收办案指令，正在全案通读在案材料并深度研判，起草文书约需 1~3 分钟，请稍候...")
-        else:
-            reply_message(message_id, "🤖 已接收任务，正在执行处理中，请稍候...")
-
         start_t = time.time()
-        try:
-            proc = subprocess.run(cmd, cwd=work_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900)
-            elapsed = round(time.time() - start_t, 1)
+        state = {
+            "step_desc": "正在全案通读在案材料并梳理事实脉络...",
+            "step_count": 0,
+            "done": False,
+            "new_cid": None,
+            "final_response": "",
+            "last_patch_t": start_t,
+            "stderr_lines": []
+        }
 
-            if proc.returncode != 0:
-                err = proc.stderr.strip() or proc.stdout.strip() or f"Code: {proc.returncode}"
+        # Background ticker thread: smoothly updates Feishu card progress & elapsed time every 3.5 seconds
+        def ticker_worker():
+            while not state["done"]:
+                time.sleep(3.5)
+                if state["done"] or not progress_msg_id:
+                    break
+                now = time.time()
+                elapsed = int(now - start_t)
+                if elapsed < 20:
+                    pct = 10 + int((elapsed / 20) * 25)  # 10% -> 35%
+                elif elapsed < 60:
+                    pct = 35 + int(((elapsed - 20) / 40) * 35)  # 35% -> 70%
+                elif elapsed < 120:
+                    pct = 70 + int(((elapsed - 60) / 60) * 18)  # 70% -> 88%
+                else:
+                    pct = min(96, 88 + int(((elapsed - 120) / 60) * 4))
+
+                card = card_builder.build_ai_progress_card(
+                    task_title=display_title,
+                    status_stage="running",
+                    elapsed_seconds=elapsed,
+                    step_desc=state["step_desc"],
+                    progress_pct=pct,
+                    is_legal_bot=IS_LEGAL_BOT
+                )
+                patch_message_card(progress_msg_id, card)
+
+        ticker = threading.Thread(target=ticker_worker, daemon=True)
+        ticker.start()
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=work_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+
+            # Read stderr in background
+            def read_stderr():
+                for eline in proc.stderr:
+                    if eline.strip():
+                        state["stderr_lines"].append(eline.strip())
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                    ev_type = evt.get("event")
+                    if ev_type == "init":
+                        cid = evt.get("conversation_id")
+                        if cid:
+                            state["new_cid"] = cid
+                    elif ev_type == "step_update":
+                        state["step_count"] += 1
+                        su = evt.get("step_update", {})
+                        stype = su.get("step_type")
+                        if stype == "tool":
+                            tname = su.get("tool_name", "")
+                            tinfo = su.get("tool_info", {}).get("parameters", {})
+                            if tname in ("view_file", "read_file"):
+                                p = tinfo.get("Path", "")
+                                fn = os.path.basename(p) if p else "证据材料"
+                                state["step_desc"] = f"正在精读在案证据《{fn}》..."
+                            elif tname == "run_command":
+                                summary = tinfo.get("toolSummary", "")
+                                cmd_str = tinfo.get("CommandLine", "")
+                                if summary:
+                                    clean_s = summary.strip('\"')
+                                    state["step_desc"] = f"正在执行分析: {clean_s}..."
+                                elif "ocr" in cmd_str.lower() or "tesseract" in cmd_str.lower():
+                                    state["step_desc"] = "正在对案卷扫描件进行多线程高精度图文识别..."
+                                elif "pdftoppm" in cmd_str.lower():
+                                    state["step_desc"] = "正在渲染案卷扫描件高清原件..."
+                                else:
+                                    state["step_desc"] = "正在核验案件事实与法条要件..."
+                            elif tname == "write_to_file":
+                                state["step_desc"] = "正在起草撰写实务文书正文..."
+                            elif tname == "manage_task":
+                                state["step_desc"] = "正在并行调度背景审读与比对任务..."
+                            elif tname == "schedule":
+                                state["step_desc"] = "正在等待证据审查与图文解析收尾..."
+                        elif stype == "agent_response":
+                            txt = su.get("content", "").strip()
+                            if txt and not txt.startswith("`") and len(txt) > 2:
+                                first_line = txt.split("\n")[0][:45]
+                                state["step_desc"] = f"正在研判: {first_line}..."
+                    elif ev_type == "result":
+                        res_obj = evt.get("result", {})
+                        state["final_response"] = res_obj.get("response", "")
+                        cid = res_obj.get("conversation_id")
+                        if cid:
+                            state["new_cid"] = cid
+                except Exception:
+                    pass
+
+            proc.wait(timeout=30)
+            state["done"] = True
+            total_elapsed = int(time.time() - start_t)
+
+            if proc.returncode != 0 and not state["final_response"]:
+                err = "\n".join(state["stderr_lines"][-5:]) or f"Exit code: {proc.returncode}"
                 print(f"[Agent Error] {err}")
-                reply_message(message_id, f"❌ 执行异常 ({elapsed}s):\n{err}")
+                if progress_msg_id:
+                    err_card = card_builder.build_ai_progress_card(
+                        task_title=display_title,
+                        status_stage="error",
+                        elapsed_seconds=total_elapsed,
+                        step_desc=err,
+                        is_legal_bot=IS_LEGAL_BOT
+                    )
+                    patch_message_card(progress_msg_id, err_card)
+                reply_message(message_id, f"❌ 执行异常 ({total_elapsed}s):\n{err}")
                 return
 
-            try:
-                res_json = json.loads(proc.stdout.strip())
-                new_cid = res_json.get("conversation_id")
-                cur_sess = session_mgr.get_session(session_key)
-                if cur_sess.get("case_dir") == work_dir and new_cid:
-                    session_mgr.update_conversation(session_key, new_cid, prompt)
+            # Update conversation memory
+            new_cid = state["new_cid"]
+            cur_sess = session_mgr.get_session(session_key)
+            if cur_sess.get("case_dir") == work_dir and new_cid:
+                session_mgr.update_conversation(session_key, new_cid, prompt)
 
-                resp_text = res_json.get("response", "").strip() or "✅ 任务执行完毕。"
-                if IS_LEGAL_BOT:
-                    resp_text += "\n\n---\n💡 办案提示：您可继续针对本案追问、补充材料，或点击【意见书】【答辩词】【代理词】出具其他文书；若需办理其他新案件，请先点击或发送【新案件】。"
-                elif has_pending:
-                    session_mgr.clear_pending_files(session_key)
+            # Update progress card to complete
+            if progress_msg_id:
+                comp_card = card_builder.build_ai_progress_card(
+                    task_title=display_title,
+                    status_stage="complete",
+                    elapsed_seconds=total_elapsed,
+                    progress_pct=100,
+                    is_legal_bot=IS_LEGAL_BOT
+                )
+                patch_message_card(progress_msg_id, comp_card)
 
-                reply_message(message_id, resp_text)
-            except json.JSONDecodeError:
-                out_text = proc.stdout.strip() or "✅ 任务完成。"
-                cur_sess = session_mgr.get_session(session_key)
-                if not IS_LEGAL_BOT and has_pending and cur_sess.get("case_dir") == work_dir:
-                    session_mgr.clear_pending_files(session_key)
-                reply_message(message_id, out_text)
+            resp_text = state["final_response"].strip() or "✅ 任务执行完毕。"
+            if IS_LEGAL_BOT:
+                resp_text += "\n\n---\n💡 办案提示：您可继续针对本案追问、补充材料，或点击【意见书】【答辩词】【代理词】出具其他文书；若需办理其他新案件，请先点击或发送【新案件】。"
+            elif has_pending:
+                session_mgr.clear_pending_files(session_key)
+
+            reply_message(message_id, resp_text)
 
         except subprocess.TimeoutExpired:
+            state["done"] = True
+            if progress_msg_id:
+                err_card = card_builder.build_ai_progress_card(
+                    task_title=display_title,
+                    status_stage="error",
+                    elapsed_seconds=int(time.time() - start_t),
+                    step_desc="任务执行超时（超过 15 分钟），已自动中止。",
+                    is_legal_bot=IS_LEGAL_BOT
+                )
+                patch_message_card(progress_msg_id, err_card)
             reply_message(message_id, "⏱️ 任务执行超时（超过 15 分钟），已自动中止。")
         except Exception as e:
+            state["done"] = True
             reply_message(message_id, f"⚠️ 处理异常: {str(e)}")
+        finally:
+            state["done"] = True
 
 
 # ----------------- Feishu Event Callback -----------------

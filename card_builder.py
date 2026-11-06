@@ -237,3 +237,95 @@ def build_upload_progress_card(
             "elements": elements
         }
 
+
+def format_duration(seconds: int) -> str:
+    """Formats seconds into human readable duration string."""
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes = seconds // 60
+    rem = seconds % 60
+    return f"{minutes} 分 {rem} 秒" if rem > 0 else f"{minutes} 分钟"
+
+
+def build_ai_progress_card(
+    task_title: str,
+    status_stage: str,  # "running", "complete", "error"
+    elapsed_seconds: int = 0,
+    step_desc: str = "",
+    progress_pct: int = 0,
+    is_legal_bot: bool = True
+) -> dict:
+    """
+    Builds dynamic real-time progress cards during AI reasoning, reading, OCR, and document drafting.
+    """
+    dur_str = format_duration(elapsed_seconds)
+    bar_str = format_progress_bar(progress_pct, 100)
+
+    if status_stage == "running":
+        header_title = "⚖️【乾祐AI实务研判】办案推进中..." if is_legal_bot else "🤖 AI 任务正在执行中..."
+        step_text = step_desc or ("正在全案通读卷宗并梳理事实脉络..." if is_legal_bot else "正在分析与执行任务...")
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**📋 研判事项:** {task_title}\n"
+                        f"**⏱️ 研判耗时:** `{dur_str}`  |  **⚡ 进度概览:** {bar_str}\n\n"
+                        f"**🔍 正在推进:**\n"
+                        f"> {step_text}\n\n"
+                        f"⏳ 复杂案卷正进行全真图文穿透与要件对齐，系统每数秒自动刷新动态，请稍候..."
+                    )
+                }
+            }
+        ]
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": header_title}, "template": "blue"},
+            "elements": elements
+        }
+
+    elif status_stage == "complete":
+        header_title = "✅【乾祐AI实务研判】文书出具完成" if is_legal_bot else "✅ AI 任务执行完成"
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**📋 研判事项:** {task_title}\n"
+                        f"**⏱️ 研判总耗时:** `{dur_str}`  |  **⚡ 进度:** `[██████████] 100.0%`\n\n"
+                        f"🎉 **全案事实梳理、争议焦点穿透及文书正文已生成完毕，请查阅下方完整文书：**"
+                    )
+                }
+            }
+        ]
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": header_title}, "template": "turquoise"},
+            "elements": elements
+        }
+
+    else:  # error
+        header_title = "⚠️ 研判任务执行异常"
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**📋 研判事项:** {task_title}\n"
+                        f"**⏱️ 耗时:** `{dur_str}`\n\n"
+                        f"**❌ 异常说明:** {step_desc or '执行过程中遇到未知错误。'}\n\n"
+                        f"💡 请尝试重新发送指令或联系管理员排查。"
+                    )
+                }
+            }
+        ]
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": header_title}, "template": "red"},
+            "elements": elements
+        }
+
+
