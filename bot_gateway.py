@@ -554,7 +554,7 @@ def cmd_materials(session_key: str, message_id: str, parts: list, parent_chat_id
     sess = session_mgr.get_session(session_key, parent_chat_id)
     pending = sess.get("pending_files", [])
     if not pending:
-        reply_message(message_id, "📋 当前案件暂未上传任何在案材料文件。\n您可以直接上传 Word (.docx)、PDF（支持多选批量发送）、压缩包 (.zip) 或证据图片，或者直接输入案情进行咨询。")
+        reply_message(message_id, "📋 当前案件暂未上传任何在案材料文件。\n您可以直接上传 Word (.docx)、PDF（支持多选批量发送）、压缩包 (.rar / .zip / .7z) 或证据图片，或者直接输入案情进行咨询。")
     else:
         file_list_str = "\n".join([f"{i+1}. 《{item['name']}》 ({item.get('size_kb', 0)} KB)" for i, item in enumerate(pending)])
         reply_message(
@@ -571,7 +571,7 @@ def cmd_reset_case(session_key: str, message_id: str, parts: list, parent_chat_i
         message_id,
         "⚖️【甘肃乾祐律师事务所 · 新案件已开启】\n\n"
         "上一案件的全部在案材料、工作目录与会话记忆已彻底清空隔离，新案件归集已从零开始。\n\n"
-        "📎 请直接上传新案材料（支持 Word .docx、PDF 多文件批量发送、.zip 压缩包、证据图片），或直接输入案情诉求进行研判。"
+        "📎 请直接上传新案材料（支持 Word .docx、PDF 多文件批量发送、.rar / .zip / .7z 压缩包、证据图片），或直接输入案情诉求进行研判。"
     )
 
 
@@ -917,15 +917,30 @@ def extract_text_from_file(file_path: str, status_cb: Optional[Callable[[str, st
                 rendered_pages = render_pdf_to_images(file_path, max_pages=100)
                 return "", rendered_pages, warnings
 
-        elif ext in (".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz"):
+        elif ext in (".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".cbr", ".r00"):
             if status_cb:
                 status_cb("extracting", f"正在解压案卷归档包《{os.path.basename(file_path)}》...")
             base_dir = os.path.dirname(file_path)
             stem = re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fa5-]', '_', os.path.splitext(os.path.basename(file_path))[0])
             unzip_dir = os.path.join(base_dir, f"unzipped_{stem}")
             os.makedirs(unzip_dir, exist_ok=True)
-            # Use 7z to extract any archive format reliably
-            subprocess.run(["/usr/bin/7z", "x", "-y", f"-o{unzip_dir}", file_path], capture_output=True, timeout=90, check=False)
+
+            # 1. Primary extractor: 7z (supports .rar, .rar5, .7z, .zip, .tar, etc.)
+            subprocess.run(["/usr/bin/7z", "x", "-y", f"-o{unzip_dir}", file_path], capture_output=True, timeout=120, check=False)
+
+            # Check if any files were unpacked
+            extracted_files = []
+            for root, dirs, files in os.walk(unzip_dir):
+                for f in files:
+                    if not f.startswith("._") and not f.startswith("~"):
+                        extracted_files.append(os.path.join(root, f))
+
+            # 2. Fallback: try unrar if 7z produced no files on a .rar file
+            if not extracted_files and ext in (".rar", ".r00", ".cbr"):
+                unrar_bin = "/usr/bin/unrar" if os.path.exists("/usr/bin/unrar") else ("/usr/bin/unrar-free" if os.path.exists("/usr/bin/unrar-free") else "")
+                if unrar_bin:
+                    subprocess.run([unrar_bin, "-x", "--force", file_path, unzip_dir], capture_output=True, timeout=120, check=False)
+
             combined_texts = []
             for root, dirs, files in os.walk(unzip_dir):
                 for sub_name in sorted(files):
@@ -943,13 +958,16 @@ def extract_text_from_file(file_path: str, status_cb: Optional[Callable[[str, st
                     if sub_txt:
                         combined_texts.append(f"=== 【压缩包内文件：{sub_name}】 ===\n{sub_txt}")
                     elif sub_pages:
-                        combined_texts.append(f"=== 【压缩包内扫描件：{sub_name}（已渲染 {len(sub_pages)} 页图片）】 ===")
+                        combined_texts.append(f"=== 【压缩包内扫描件/证据图片：{sub_name}（原图已就绪供AI视觉审读）】 ===")
 
             full_arch_text = "\n\n".join(combined_texts).strip()
             if full_arch_text:
                 with open(txt_path, "w", encoding="utf-8") as f:
                     f.write(full_arch_text)
             return full_arch_text, rendered_pages, warnings
+
+        elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]:
+            return "", [file_path], warnings
 
         elif ext in [".txt", ".md", ".json", ".csv"]:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1664,7 +1682,7 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             raw_text = json.loads(msg.content).get("text", "").strip()
             clean_text = re.sub(r"@_user_\d+\s*", "", raw_text).strip()
         else:
-            reply_message(msg_id, f"ℹ️ 目前支持文本、Word/PDF 文档（支持多选批量发送）、压缩包 (.zip) 以及证据图片，暂不支持此类消息类型 ({msg.message_type})。")
+            reply_message(msg_id, f"ℹ️ 目前支持文本、Word/PDF 文档（支持多选批量发送）、压缩包 (.rar / .zip / .7z) 以及证据图片，暂不支持此类消息类型 ({msg.message_type})。")
             return
 
         if not clean_text:
@@ -1692,7 +1710,7 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     msg_id,
                     "⚖️【甘肃乾祐律师事务所 · 新案件已开启】\n\n"
                     "上一案件的全部在案材料、独立工作目录与会话记忆已彻底清空隔离，新案件归集已从零开始。\n\n"
-                    "📎 请直接上传新案材料（支持 Word .docx、PDF 多文件批量发送、.zip 压缩包、合同/欠条等证据图片），或直接输入案情诉求进行研判。"
+                    "📎 请直接上传新案材料（支持 Word .docx、PDF 多文件批量发送、.rar / .zip / .7z 压缩包、合同/欠条等证据图片），或直接输入案情诉求进行研判。"
                 )
                 return
 
