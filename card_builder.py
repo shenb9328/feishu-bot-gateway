@@ -66,3 +66,174 @@ def build_history_card(current_id: str, history_list: list) -> dict:
             {"tag": "div", "text": {"tag": "lark_md", "content": "👉 发送 `/switch <序号>`（例如 `/switch 1`）切回对应会话\n👉 发送 `/new` 开启新会话"}}
         ]
     }
+
+
+def format_size(bytes_num: int) -> str:
+    """Formats bytes into human readable string (B, KB, MB, GB)."""
+    if not bytes_num or bytes_num < 0:
+        return "0 KB"
+    if bytes_num < 1024:
+        return f"{bytes_num} B"
+    elif bytes_num < 1024 * 1024:
+        return f"{round(bytes_num / 1024, 1)} KB"
+    elif bytes_num < 1024 * 1024 * 1024:
+        return f"{round(bytes_num / (1024 * 1024), 1)} MB"
+    else:
+        return f"{round(bytes_num / (1024 * 1024 * 1024), 2)} GB"
+
+
+def format_progress_bar(current: int, total: int, width: int = 10) -> str:
+    """Generates ASCII/block progress bar [████░░░░░░] 40.0%."""
+    if total <= 0:
+        return ""
+    ratio = min(1.0, max(0.0, current / total))
+    filled = int(round(ratio * width))
+    bar = "█" * filled + "░" * (width - filled)
+    percent = round(ratio * 100, 1)
+    return f"`[{bar}] {percent}%`"
+
+
+def build_upload_progress_card(
+    file_name: str,
+    status_stage: str,  # "downloading", "extracting", "rendering", "complete", "error"
+    current_bytes: int = 0,
+    total_bytes: int = 0,
+    current_idx: int = 1,
+    total_files: int = 1,
+    detail_msg: str = "",
+    case_materials: list = None,
+    is_legal_bot: bool = True
+) -> dict:
+    """
+    Builds dynamic interactive cards for real-time file upload progress and completion status.
+    Supports real-time patch updates during streaming download, extraction, and scanned PDF page rendering.
+    """
+    multi_file_prefix = f"（第 {current_idx}/{total_files} 份）" if total_files > 1 else ""
+    size_str = format_size(total_bytes or current_bytes)
+
+    if status_stage == "downloading":
+        bar_str = format_progress_bar(current_bytes, total_bytes)
+        progress_info = f"{bar_str} `({format_size(current_bytes)} / {size_str})`" if bar_str else f"`已传输 {format_size(current_bytes)}`"
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**📁 正在接收材料:** 《{file_name}》 {multi_file_prefix}\n"
+                        f"**⏬ 传输进度:** {progress_info}\n\n"
+                        f"⏳ 正在从飞书云端通道高速下载至办案工作区，请稍候..."
+                    )
+                }
+            }
+        ]
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": "📥 案卷材料接收中..."}, "template": "blue"},
+            "elements": elements
+        }
+
+    elif status_stage == "extracting":
+        step_text = detail_msg or "正在解压案卷归档包并预处理文档内容..."
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**📁 目标材料:** 《{file_name}》 {multi_file_prefix}（{size_str}）\n"
+                        f"**⚙️ 当前步骤:** {step_text}\n\n"
+                        f"⏳ 大文件/归档包解压预处理中，请稍候..."
+                    )
+                }
+            }
+        ]
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": "⚙️ 案卷解压与文档预解析中..."}, "template": "orange"},
+            "elements": elements
+        }
+
+    elif status_stage == "rendering":
+        step_text = detail_msg or "正在将扫描件 PDF 逐页渲染为高清原件..."
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**📁 渲染材料:** 《{file_name}》 {multi_file_prefix}（{size_str}）\n"
+                        f"**📄 案卷渲染:** {step_text}\n\n"
+                        f"⏳ 扫描件高清原件渲染中，完成后将自动供 AI 进行法律视觉审读..."
+                    )
+                }
+            }
+        ]
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": "📄 案卷高清原件渲染中..."}, "template": "orange"},
+            "elements": elements
+        }
+
+    elif status_stage == "complete":
+        elements = []
+        detail_line = f"\n{detail_msg}" if detail_msg else ""
+        header_text = (
+            f"**📁 接收材料:** 《{file_name}》 {multi_file_prefix}（{size_str}）"
+            f"{detail_line}"
+        )
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": header_text}})
+
+        # Material Checklist
+        if case_materials:
+            elements.append({"tag": "hr"})
+            lines = []
+            for i, item in enumerate(case_materials, 1):
+                sz = item.get("size_kb", 0)
+                sz_str = f"{round(sz / 1024, 1)} MB" if sz >= 1024 else f"{sz} KB"
+                char_str = f"（纯文本 {item['char_count']} 字）" if item.get("char_count") else ""
+                page_str = f"（高清原件 {len(item.get('rendered_pages', []))} 页）" if item.get("rendered_pages") else ""
+                lines.append(f"**[{i}]** 《{item['name']}》 `({sz_str})` {char_str}{page_str}")
+            checklist_text = f"📋 **【当前本案在案材料清单】（共 {len(case_materials)} 份）：**\n" + "\n".join(lines)
+            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": checklist_text}})
+
+        elements.append({"tag": "hr"})
+        if is_legal_bot:
+            guide_text = (
+                "💡 **快捷办案指引：**\n"
+                "本案材料已就绪！如还有补充证据请继续发送；若材料已齐备，请直接发送具体指令，或点击下方快捷词复制发送：\n\n"
+                "• **【综合案情研判】** —— 梳理本案事实脉络、争议焦点穿透及诉讼质证策略\n"
+                "• **【起草法律意见书】** —— 出具甘肃乾祐律师事务所实务标准格式法律意见书\n"
+                "• **【起草民事答辩状】** —— 针对原告诉讼请求及证据出具诉讼答辩状\n"
+                "• **【起草代理词】** —— 出具乾祐标准一审/二审/再审民商事实务代理词"
+            )
+        else:
+            guide_text = "💡 如还有补充材料请继续发送；若材料已齐备，请直接发送指令开始处理。"
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": guide_text}})
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": "✅ 案卷材料归集就绪"}, "template": "turquoise"},
+            "elements": elements
+        }
+
+    else:  # error
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**📁 目标材料:** 《{file_name}》 {multi_file_prefix}\n"
+                        f"**❌ 异常说明:** {detail_msg or '接收或处理过程中发生异常。'}\n\n"
+                        f"💡 请尝试重新上传该文件，或检查网络连接。"
+                    )
+                }
+            }
+        ]
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": "⚠️ 材料接收或解析异常"}, "template": "red"},
+            "elements": elements
+        }
+

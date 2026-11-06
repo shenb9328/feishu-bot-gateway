@@ -2,14 +2,21 @@ import os
 import re
 import json
 import time
+import uuid
+import threading
 from typing import Dict, Any, List, Optional, Tuple
+
 
 class SessionManager:
     """
-    Session & Workspace Manager with support for Feishu Team Channel-to-Project 
-    and Topic-to-Session tree structure mapping.
+    Thread-safe Session & Workspace Manager with support for Feishu Team Channel-to-Project,
+    Topic-to-Session tree structure mapping, and strict per-case directory & context isolation.
     """
+    # Auto-expire an unarchived case if idle for > 12 hours when new files are uploaded
+    CASE_IDLE_RESET_SECONDS = 12 * 3600
+
     def __init__(self, storage_path: str, default_root: str, bindings_path: Optional[str] = None):
+        self._lock = threading.RLock()
         self.storage_path = storage_path
         self.default_root = default_root
         self.home_dir = os.path.expanduser("~")
@@ -27,37 +34,96 @@ class SessionManager:
         self._load()
 
     def _load(self):
-        if os.path.exists(self.storage_path):
-            try:
-                with open(self.storage_path, "r", encoding="utf-8") as f:
-                    self.sessions = json.load(f)
-            except Exception as e:
-                print(f"[SessionManager] Load sessions failed: {e}")
-                self.sessions = {}
+        with self._lock:
+            if os.path.exists(self.storage_path):
+                try:
+                    with open(self.storage_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, dict):
+                            self.sessions = data
+                except Exception as e:
+                    print(f"[SessionManager] Load sessions failed: {e}")
 
-        if os.path.exists(self.bindings_path):
-            try:
-                with open(self.bindings_path, "r", encoding="utf-8") as f:
-                    self.chat_bindings = json.load(f)
-            except Exception as e:
-                print(f"[SessionManager] Load bindings failed: {e}")
-                self.chat_bindings = {}
+            if os.path.exists(self.bindings_path):
+                try:
+                    with open(self.bindings_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, dict):
+                            self.chat_bindings = data
+                except Exception as e:
+                    print(f"[SessionManager] Load bindings failed: {e}")
+
+    @staticmethod
+    def _atomic_write_json(path: str, data: Any):
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _save(self):
-        try:
-            with open(self.storage_path, "w", encoding="utf-8") as f:
-                json.dump(self.sessions, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"[SessionManager] Save sessions failed: {e}")
+        with self._lock:
+            try:
+                self._atomic_write_json(self.storage_path, self.sessions)
+            except Exception as e:
+                print(f"[SessionManager] Save sessions failed: {e}")
 
-        try:
-            with open(self.bindings_path, "w", encoding="utf-8") as f:
-                json.dump(self.chat_bindings, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"[SessionManager] Save bindings failed: {e}")
+            try:
+                self._atomic_write_json(self.bindings_path, self.chat_bindings)
+            except Exception as e:
+                print(f"[SessionManager] Save bindings failed: {e}")
+
+    def _new_case_dir(self, base_project_dir: str) -> str:
+        """Creates a fresh, physically isolated directory for a single case."""
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        short_id = uuid.uuid4().hex[:6]
+        case_dir = os.path.join(base_project_dir, "cases", f"case_{ts}_{short_id}")
+        os.makedirs(case_dir, exist_ok=True)
+        return case_dir
+
+    def _ensure_case_dir_unlocked(self, sess: Dict[str, Any]) -> str:
+        """Ensures the session has an existing isolated case_dir on disk."""
+        base_dir = sess.get("project_dir") or self.default_root
+        case_dir = sess.get("case_dir")
+        if not case_dir or not os.path.isdir(case_dir):
+            case_dir = self._new_case_dir(base_dir)
+            sess["case_dir"] = case_dir
+        return case_dir
+
+    def get_or_create_case_dir(self, session_key: str, for_upload: bool = False) -> str:
+        with self._lock:
+            self._load()
+            sess = self._get_session_unlocked(session_key)
+            now = time.time()
+            last_updated = sess.get("updated_at", 0)
+            is_stale = bool(last_updated and (now - last_updated > self.CASE_IDLE_RESET_SECONDS))
+            if for_upload and (sess.get("case_status") == "concluded" or is_stale):
+                reason = "上一案件已结案归档" if sess.get("case_status") == "concluded" else "距离上次操作已超过12小时"
+                print(f"[SessionManager] {reason}，检测到新文件上传，自动开启全新案件隔离目录")
+                self._archive_current_conversation_unlocked(sess)
+                sess["conversation_id"] = None
+                sess["history"] = []
+                sess["pending_files"] = []
+                sess["case_dir"] = self._new_case_dir(sess.get("project_dir") or self.default_root)
+                sess["case_status"] = "in_progress"
+                sess["updated_at"] = now
+            else:
+                self._ensure_case_dir_unlocked(sess)
+            self._save()
+            return sess["case_dir"]
 
     def list_available_workspaces(self) -> List[str]:
-        """Lists local project folders in /home/shenb9328_gmail_com."""
+        """Lists local project folders in home_dir."""
         projects = []
         ignores = {"systemd", "node-compile-cache", "lo_profile", "pdf_check", "tmp"}
         if os.path.exists(self.home_dir):
@@ -70,10 +136,7 @@ class SessionManager:
     def match_project_from_name(self, raw_name: str) -> Tuple[str, str]:
         """
         Smart match Feishu channel/chat name to a local workspace directory.
-        e.g. '飞书 测试项目' -> ('飞书', '/home/shenb9328_gmail_com/飞书')
-             '#光储Token机' -> ('光储token机', '/home/shenb9328_gmail_com/光储token机')
         """
-        # Clean name: strip emojis, brackets, hashes, spaces
         clean = re.sub(r"[#\[\]【】()（）📁🤖💬🚀\s]+", " ", raw_name).strip()
         if not clean:
             return ("default", self.default_root)
@@ -81,12 +144,10 @@ class SessionManager:
         available = self.list_available_workspaces()
         clean_lower = clean.lower()
 
-        # 1. Exact match
         for d in available:
             if clean_lower == d.lower():
                 return (d, os.path.join(self.home_dir, d))
 
-        # 2. Substring match: check if any project name is contained in the channel name
         matches = []
         for d in available:
             if d.lower() in clean_lower or clean_lower in d.lower():
@@ -95,7 +156,6 @@ class SessionManager:
             best = max(matches, key=len)
             return (best, os.path.join(self.home_dir, best))
 
-        # 3. If clean name is a specific new project name, auto create workspace
         generics = {"default", "临时", "测试", "笑话", "general", "未命名", "通用"}
         if clean_lower not in generics and len(clean) >= 2:
             target_dir = os.path.join(self.home_dir, clean)
@@ -115,11 +175,7 @@ class SessionManager:
             return scratch_target
         return home_target
 
-    def bind_chat(self, chat_id: str, chat_name: str = "", project_name: Optional[str] = None, chat_mode: str = "group") -> Dict[str, Any]:
-        """
-        Binds a channel/group to a project workspace directory.
-        """
-        self._load()
+    def _bind_chat_unlocked(self, chat_id: str, chat_name: str = "", project_name: Optional[str] = None, chat_mode: str = "group") -> Dict[str, Any]:
         binding = self.chat_bindings.get(chat_id, {})
 
         if project_name:
@@ -142,53 +198,64 @@ class SessionManager:
         binding["updated_at"] = time.time()
 
         self.chat_bindings[chat_id] = binding
-        self._save()
         return binding
+
+    def bind_chat(self, chat_id: str, chat_name: str = "", project_name: Optional[str] = None, chat_mode: str = "group") -> Dict[str, Any]:
+        """Binds a channel/group to a project workspace directory."""
+        with self._lock:
+            self._load()
+            binding = self._bind_chat_unlocked(chat_id, chat_name=chat_name, project_name=project_name, chat_mode=chat_mode)
+            self._save()
+            return dict(binding)
 
     def get_topic_session(self, chat_id: str, topic_id: str, chat_name: str = "", chat_mode: str = "topic", first_prompt: str = "") -> Dict[str, Any]:
         """
         Retrieves or creates an isolated session for a specific topic in a channel.
         Inherits project workspace from the parent channel binding.
         """
-        self._load()
-        binding = self.bind_chat(chat_id, chat_name=chat_name, chat_mode=chat_mode)
-        session_key = f"topic:{chat_id}:{topic_id}"
+        with self._lock:
+            self._load()
+            binding = self._bind_chat_unlocked(chat_id, chat_name=chat_name, chat_mode=chat_mode)
+            session_key = f"topic:{chat_id}:{topic_id}"
 
-        if session_key not in self.sessions:
-            title = first_prompt.strip().replace("\n", " ")[:30] if first_prompt else "新话题会话"
-            self.sessions[session_key] = {
-                "chat_id": session_key,
-                "parent_chat_id": chat_id,
-                "topic_id": topic_id,
-                "topic_title": title,
-                "channel_name": binding.get("chat_name", chat_name or "项目频道"),
-                "project_name": binding.get("project_name", "default"),
-                "project_dir": binding.get("project_dir", self.default_root),
-                "conversation_id": None,
-                "conversations": [],
-                "history": [],
-                "created_at": time.time(),
-                "updated_at": time.time()
-            }
+            if session_key not in self.sessions:
+                title = first_prompt.strip().replace("\n", " ")[:30] if first_prompt else "新话题会话"
+                proj_dir = binding.get("project_dir", self.default_root)
+                self.sessions[session_key] = {
+                    "chat_id": session_key,
+                    "parent_chat_id": chat_id,
+                    "topic_id": topic_id,
+                    "topic_title": title,
+                    "channel_name": binding.get("chat_name", chat_name or "项目频道"),
+                    "project_name": binding.get("project_name", "default"),
+                    "project_dir": proj_dir,
+                    "case_dir": self._new_case_dir(proj_dir),
+                    "conversation_id": None,
+                    "conversations": [],
+                    "history": [],
+                    "pending_files": [],
+                    "case_status": "idle",
+                    "created_at": time.time(),
+                    "updated_at": time.time()
+                }
+            else:
+                sess = self.sessions[session_key]
+                sess.setdefault("parent_chat_id", chat_id)
+                sess.setdefault("topic_id", topic_id)
+                sess.setdefault("topic_title", "话题会话")
+                sess.setdefault("channel_name", binding.get("chat_name", chat_name or "项目频道"))
+                sess.setdefault("conversations", [])
+                sess.setdefault("history", [])
+                sess.setdefault("pending_files", [])
+                if binding.get("custom_bound") and sess.get("project_name") != binding.get("project_name"):
+                    sess["project_name"] = binding["project_name"]
+                    sess["project_dir"] = binding["project_dir"]
+                self._ensure_case_dir_unlocked(sess)
+
             self._save()
-        else:
-            sess = self.sessions[session_key]
-            sess.setdefault("parent_chat_id", chat_id)
-            sess.setdefault("topic_id", topic_id)
-            sess.setdefault("topic_title", "话题会话")
-            sess.setdefault("channel_name", binding.get("chat_name", chat_name or "项目频道"))
-            sess.setdefault("conversations", [])
-            sess.setdefault("history", [])
-            # If the parent channel was manually rebound, update session project
-            if binding.get("custom_bound") and sess.get("project_name") != binding.get("project_name"):
-                sess["project_name"] = binding["project_name"]
-                sess["project_dir"] = binding["project_dir"]
+            return dict(self.sessions[session_key])
 
-        return self.sessions[session_key]
-
-    def get_session(self, session_key: str, parent_chat_id: Optional[str] = None) -> Dict[str, Any]:
-        """Direct chat session or general lookup."""
-        self._load()
+    def _get_session_unlocked(self, session_key: str, parent_chat_id: Optional[str] = None) -> Dict[str, Any]:
         if session_key not in self.sessions:
             proj_name, proj_dir = "default", self.default_root
             if parent_chat_id and parent_chat_id in self.chat_bindings:
@@ -200,130 +267,213 @@ class SessionManager:
                 "parent_chat_id": parent_chat_id,
                 "project_name": proj_name,
                 "project_dir": proj_dir,
+                "case_dir": self._new_case_dir(proj_dir),
                 "conversation_id": None,
                 "conversations": [],
                 "history": [],
+                "pending_files": [],
+                "case_status": "idle",
                 "updated_at": time.time()
             }
-            self._save()
         else:
-            self.sessions[session_key].setdefault("conversations", [])
-            self.sessions[session_key].setdefault("history", [])
+            sess = self.sessions[session_key]
+            sess.setdefault("conversations", [])
+            sess.setdefault("history", [])
+            sess.setdefault("pending_files", [])
+            self._ensure_case_dir_unlocked(sess)
         return self.sessions[session_key]
 
-    def set_project(self, session_key: str, project_name: str, parent_chat_id: Optional[str] = None) -> Dict[str, Any]:
-        """Sets project for current session, and parent channel if in group."""
-        sess = self.get_session(session_key, parent_chat_id)
-        clean_name = os.path.basename(project_name.strip())
-        target_dir = self.resolve_project_dir(clean_name)
-        os.makedirs(target_dir, exist_ok=True)
+    def get_session(self, session_key: str, parent_chat_id: Optional[str] = None) -> Dict[str, Any]:
+        """Direct chat session or general lookup."""
+        with self._lock:
+            self._load()
+            existed = session_key in self.sessions
+            had_case_dir = existed and bool(self.sessions[session_key].get("case_dir")) and os.path.isdir(self.sessions[session_key].get("case_dir", ""))
+            sess = self._get_session_unlocked(session_key, parent_chat_id)
+            if not existed or not had_case_dir:
+                self._save()
+            return dict(sess)
 
-        self.archive_current_conversation(session_key)
-        sess["project_name"] = clean_name
-        sess["project_dir"] = target_dir
-        sess["conversation_id"] = None
-        sess["updated_at"] = time.time()
-
-        if parent_chat_id:
-            # Bind parent channel
-            self.bind_chat(parent_chat_id, project_name=clean_name)
-
-        self._save()
-        return sess
-
-    def archive_current_conversation(self, session_key: str):
-        sess = self.get_session(session_key)
+    def _archive_current_conversation_unlocked(self, sess: Dict[str, Any]):
         current_id = sess.get("conversation_id")
         if not current_id:
             return
 
-        for c in sess["conversations"]:
-            if c["id"] == current_id:
+        convs = sess.setdefault("conversations", [])
+        for c in convs:
+            if c.get("id") == current_id:
                 return
 
-        title = sess["history"][0].get("prompt", "会话")[:30] if sess.get("history") else "未命名会话"
-        sess["conversations"].insert(0, {
+        hist = sess.get("history", [])
+        title = hist[0].get("prompt", "会话")[:30] if hist else "未命名会话"
+        convs.insert(0, {
             "id": current_id,
             "title": title,
-            "project_name": sess["project_name"],
-            "turn_count": len(sess.get("history", [])),
+            "project_name": sess.get("project_name", "default"),
+            "case_dir": sess.get("case_dir", ""),
+            "turn_count": len(hist),
             "archived_at": time.strftime("%Y-%m-%d %H:%M:%S")
         })
-        sess["conversations"] = sess["conversations"][:20]
+        sess["conversations"] = convs[:20]
 
-    def reset_conversation(self, session_key: str) -> Dict[str, Any]:
-        sess = self.get_session(session_key)
-        self.archive_current_conversation(session_key)
-        sess["conversation_id"] = None
-        sess["history"] = []
-        sess["updated_at"] = time.time()
-        self._save()
-        return sess
+    def archive_current_conversation(self, session_key: str):
+        with self._lock:
+            self._load()
+            sess = self._get_session_unlocked(session_key)
+            self._archive_current_conversation_unlocked(sess)
+            self._save()
 
-    def update_conversation(self, session_key: str, conversation_id: str, user_prompt: str = ""):
-        sess = self.get_session(session_key)
-        sess["conversation_id"] = conversation_id
-        sess["updated_at"] = time.time()
-        if user_prompt:
-            hist = sess.setdefault("history", [])
-            hist.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "prompt": user_prompt[:80]})
-            if len(hist) > 30:
-                sess["history"] = hist[-30:]
-        self._save()
+    def set_project(self, session_key: str, project_name: str, parent_chat_id: Optional[str] = None) -> Dict[str, Any]:
+        """Sets project for current session, and parent channel if in group."""
+        with self._lock:
+            self._load()
+            sess = self._get_session_unlocked(session_key, parent_chat_id)
+            clean_name = os.path.basename(project_name.strip())
+            target_dir = self.resolve_project_dir(clean_name)
+            os.makedirs(target_dir, exist_ok=True)
 
-    def get_history_list(self, session_key: str, limit: int = 8) -> List[Dict[str, Any]]:
-        self._load()
-        sess = self.get_session(session_key)
-        self.archive_current_conversation(session_key)
-        results = []
-        cur_id = sess.get("conversation_id")
+            self._archive_current_conversation_unlocked(sess)
+            sess["project_name"] = clean_name
+            sess["project_dir"] = target_dir
+            sess["case_dir"] = self._new_case_dir(target_dir)
+            sess["conversation_id"] = None
+            sess["history"] = []
+            sess["pending_files"] = []
+            sess["case_status"] = "idle"
+            sess["updated_at"] = time.time()
 
-        for c in sess.get("conversations", []):
-            cid = c.get("id")
-            if cid:
-                results.append({
-                    "id": cid,
-                    "title": c.get("title", "历史对话"),
-                    "time": c.get("archived_at", ""),
-                    "turn_count": c.get("turn_count", 1),
-                    "is_current": (cid == cur_id),
-                    "source": "飞书"
-                })
-        return results[:limit]
+            if parent_chat_id:
+                self._bind_chat_unlocked(parent_chat_id, project_name=clean_name)
 
-    def switch_to_conversation(self, session_key: str, target: str) -> Optional[Dict[str, Any]]:
-        history = self.get_history_list(session_key, limit=20)
-        target_conv = None
+            self._save()
+            return dict(sess)
 
-        if target.isdigit():
-            idx = int(target) - 1
-            if 0 <= idx < len(history):
-                target_conv = history[idx]
-        else:
-            clean = target.strip()
-            for h in history:
-                if h["id"].startswith(clean):
-                    target_conv = h
-                    break
+    def clear_pending_files(self, session_key: str):
+        with self._lock:
+            self._load()
+            if session_key in self.sessions:
+                sess = self.sessions[session_key]
+                sess["pending_files"] = []
+                sess["updated_at"] = time.time()
+                self._save()
 
-        if target_conv:
-            sess = self.get_session(session_key)
-            self.archive_current_conversation(session_key)
-            sess["conversation_id"] = target_conv["id"]
+    def add_pending_file(self, session_key: str, file_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Adds an uploaded file to the current case's material list.
+        Only resets conversation if the session was explicitly concluded/archived or idle > 12h.
+        """
+        with self._lock:
+            self._load()
+            sess = self._get_session_unlocked(session_key)
+            now = time.time()
+            last_updated = sess.get("updated_at", 0)
+            is_stale = bool(last_updated and (now - last_updated > self.CASE_IDLE_RESET_SECONDS))
+
+            sess["case_status"] = "in_progress"
+            self._ensure_case_dir_unlocked(sess)
+            pending = sess.setdefault("pending_files", [])
+            # Avoid duplicate entries if same file_key or path is added
+            existing_paths = {item.get("path") for item in pending if item.get("path")}
+            if file_info.get("path") not in existing_paths:
+                pending.append(file_info)
+            sess["updated_at"] = now
+            self._save()
+            return list(pending)
+
+    def reset_conversation(self, session_key: str, status: str = "idle") -> Dict[str, Any]:
+        """
+        Completely resets the current case/conversation:
+        - Archives the previous conversation_id into history
+        - Clears conversation_id, history, and pending_files
+        - Creates a brand-new isolated case_dir on disk so the LLM cannot see old files
+        """
+        with self._lock:
+            self._load()
+            sess = self._get_session_unlocked(session_key)
+            self._archive_current_conversation_unlocked(sess)
+            base_dir = sess.get("project_dir") or self.default_root
+            sess["conversation_id"] = None
+            sess["history"] = []
+            sess["pending_files"] = []
+            sess["case_dir"] = self._new_case_dir(base_dir)
+            sess["case_status"] = status
             sess["updated_at"] = time.time()
             self._save()
-            return target_conv
-        return None
+            return dict(sess)
+
+    def update_conversation(self, session_key: str, conversation_id: str, user_prompt: str = ""):
+        with self._lock:
+            self._load()
+            sess = self._get_session_unlocked(session_key)
+            sess["conversation_id"] = conversation_id
+            sess["case_status"] = "in_progress"
+            sess["updated_at"] = time.time()
+            if user_prompt:
+                hist = sess.setdefault("history", [])
+                hist.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "prompt": user_prompt[:80]})
+                if len(hist) > 30:
+                    sess["history"] = hist[-30:]
+            self._save()
+
+    def get_history_list(self, session_key: str, limit: int = 8) -> List[Dict[str, Any]]:
+        with self._lock:
+            self._load()
+            sess = self._get_session_unlocked(session_key)
+            self._archive_current_conversation_unlocked(sess)
+            self._save()
+            results = []
+            cur_id = sess.get("conversation_id")
+
+            for c in sess.get("conversations", []):
+                cid = c.get("id")
+                if cid:
+                    results.append({
+                        "id": cid,
+                        "title": c.get("title", "历史对话"),
+                        "time": c.get("archived_at", ""),
+                        "turn_count": c.get("turn_count", 1),
+                        "is_current": (cid == cur_id),
+                        "source": "飞书"
+                    })
+            return results[:limit]
+
+    def switch_to_conversation(self, session_key: str, target: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            history = self.get_history_list(session_key, limit=20)
+            target_conv = None
+
+            if target.isdigit():
+                idx = int(target) - 1
+                if 0 <= idx < len(history):
+                    target_conv = history[idx]
+            else:
+                clean = target.strip()
+                for h in history:
+                    if h["id"].startswith(clean):
+                        target_conv = h
+                        break
+
+            if target_conv:
+                self._load()
+                sess = self._get_session_unlocked(session_key)
+                self._archive_current_conversation_unlocked(sess)
+                sess["conversation_id"] = target_conv["id"]
+                sess["updated_at"] = time.time()
+                self._save()
+                return target_conv
+            return None
 
     def set_model(self, session_key: str, model_name: Optional[str] = None) -> str:
-        sess = self.get_session(session_key)
-        if model_name:
-            sess["model"] = model_name
-        else:
-            sess.pop("model", None)
-        sess["updated_at"] = time.time()
-        self._save()
-        return sess.get("model", "")
+        with self._lock:
+            self._load()
+            sess = self._get_session_unlocked(session_key)
+            if model_name:
+                sess["model"] = model_name
+            else:
+                sess.pop("model", None)
+            sess["updated_at"] = time.time()
+            self._save()
+            return sess.get("model", "")
 
     def list_projects(self) -> List[str]:
         projects = ["default"]
