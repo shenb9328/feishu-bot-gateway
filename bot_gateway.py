@@ -171,6 +171,31 @@ def get_task_lock(session_key: str) -> threading.Lock:
         return task_locks[session_key]
 
 
+# File Processing Lock & Status Tracking per session
+file_busy_lock = threading.Lock()
+file_busy_sessions: Dict[str, Dict[str, Any]] = {}
+
+
+def set_session_file_busy(session_key: str, file_name: str, stage: str = "parsing") -> None:
+    with file_busy_lock:
+        file_busy_sessions[session_key] = {
+            "file_name": file_name,
+            "stage": stage,
+            "start_time": time.time(),
+            "last_notice_time": 0
+        }
+
+
+def clear_session_file_busy(session_key: str) -> None:
+    with file_busy_lock:
+        file_busy_sessions.pop(session_key, None)
+
+
+def is_session_file_busy(session_key: str) -> Optional[Dict[str, Any]]:
+    with file_busy_lock:
+        return file_busy_sessions.get(session_key)
+
+
 # Feishu API Client & REST Helper
 client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).log_level(lark.LogLevel.INFO).build()
 
@@ -1152,6 +1177,11 @@ def handle_incoming_files_batch(
     and providing dynamic real-time progress card updates.
     File upload runs concurrently without being blocked by long-running agent tasks.
     """
+    first_att = attachments[0] if attachments else {"name": "材料"}
+    total_files = len(attachments)
+    summary_name = first_att["name"] if total_files == 1 else f"《{first_att['name']}》等 {total_files} 个材料"
+    set_session_file_busy(session_key, summary_name, "parsing")
+
     try:
         case_dir = session_mgr.get_or_create_case_dir(session_key, for_upload=True)
         materials_dir = os.path.join(case_dir, "materials")
@@ -1160,11 +1190,9 @@ def handle_incoming_files_batch(
         saved_notes = []
         all_warnings = []
         pending = []
-        total_files = len(attachments)
         total_batch_bytes = 0
 
         # Send initial progress card immediately so the user sees instant feedback!
-        first_att = attachments[0]
         init_card = card_builder.build_upload_progress_card(
             file_name=first_att["name"],
             status_stage="downloading",
@@ -1312,6 +1340,27 @@ def handle_incoming_files_batch(
         else:
             reply_message(message_id, final_card, "interactive")
 
+        # Actively notify user in chat that file processing/OCR is 100% complete
+        if IS_LEGAL_BOT:
+            total_chars = sum([m.get("char_count", 0) for m in pending])
+            char_info = f"，累计提取纯文本 {total_chars:,} 字" if total_chars else ""
+            done_prompt = (
+                f"🔔 **【案卷材料解析完毕 · 请指示】**\n\n"
+                f"《{summary_name}》已全部解压、高清逐页渲染并完成高精 OCR 图文识别（共归集在案材料 {len(pending)} 份{char_info}）！\n\n"
+                f"👉 **材料库已就绪，操作锁已解除，您现在可以随时开始办案**：\n"
+                f"• 点击或回复 **【综合案情研判】**：梳理全案事实脉络、诉讼质证与争议焦点穿透\n"
+                f"• 点击或回复 **【出具法律意见书】**：秒级起草乾祐标准体例《法律意见书》\n"
+                f"• 点击或回复 **【起草民事答辩状】**：针对原告主张起草乾祐规范《民事答辩状》\n"
+                f"• 点击或回复 **【起草代理词】**：起草规范民商事实务代理词\n"
+                f"• 或直接在下方输入您对本案的具体要求与问题。"
+            )
+        else:
+            done_prompt = (
+                f"🔔 **【参考材料解析完毕】**\n\n"
+                f"《{summary_name}》已全部接收并预解析完毕，操作锁已解除！您现在可以发送指令开始分析。"
+            )
+        reply_message(message_id, done_prompt)
+
         # If user sent a substantive prompt together with the files in a 'post' message, execute it immediately
         norm_acc = accompanying_text.strip("。！!？? \t\r\n")
         if accompanying_text and norm_acc not in UPLOAD_DONE_TRIGGERS and norm_acc not in NEW_CASE_TRIGGERS:
@@ -1320,10 +1369,8 @@ def handle_incoming_files_batch(
     except Exception as e:
         print(f"[Feishu File Batch Error] {e}")
         reply_message(message_id, f"⚠️ 保存文件时发生异常: {str(e)}")
-
-    except Exception as e:
-        print(f"[Feishu File Batch Error] {e}")
-        reply_message(message_id, f"⚠️ 保存文件时发生异常: {str(e)}")
+    finally:
+        clear_session_file_busy(session_key)
 
 
 def handle_incoming_file(session_key: str, message_id: str, file_key: str, file_name: str, resource_type: str = "file"):
@@ -1338,8 +1385,18 @@ def handle_incoming_file(session_key: str, message_id: str, file_key: str, file_
 # ----------------- Agent Task Execution -----------------
 def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_chat_id: str = None):
     """Executes prompt via agy CLI serialized per session_key and returns response."""
+    file_busy = is_session_file_busy(session_key)
+    if file_busy:
+        fn = file_busy.get("file_name", "案卷材料")
+        reply_message(message_id, f"⏳ 案卷《{fn}》正在后台高精解析中，请等待解析完成后再执行分析。")
+        return
+
     task_lock = get_task_lock(session_key)
-    with task_lock:
+    if not task_lock.acquire(blocking=False):
+        reply_message(message_id, "⏳【办案研判进行中】当前已有法律分析或文书起草任务正在深度研判中，请等待当前文书交付后再发送新指令。")
+        return
+
+    try:
         sess = session_mgr.get_session(session_key, parent_chat_id)
         project_dir = sess.get("project_dir") or DEFAULT_PROJECT_DIR
         if not os.path.isdir(project_dir):
@@ -1647,6 +1704,11 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
             reply_message(message_id, f"⚠️ 处理异常: {str(e)}")
         finally:
             state["done"] = True
+    finally:
+        try:
+            task_lock.release()
+        except RuntimeError:
+            pass
 
 
 # ----------------- Feishu Event Callback -----------------
@@ -1767,9 +1829,27 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         if not clean_text:
             return
 
+        # Check if the session is currently locked busy processing files/OCR
+        file_busy = is_session_file_busy(session_key)
+        if file_busy:
+            fn = file_busy.get("file_name", "案卷材料")
+            now = time.time()
+            if now - file_busy.get("last_notice_time", 0) > 4:
+                file_busy["last_notice_time"] = now
+                reply_message(
+                    msg_id,
+                    f"⏳【案卷深度解析中 · 操作已锁定】\n\n"
+                    f"系统正在后台对《{fn}》进行解压、逐页高清渲染与高精 OCR 图文识别。\n"
+                    f"在案卷处理完成前，分析与起草文书操作已自动锁定忽略，请勿频繁点击。\n\n"
+                    f"🔔 解析完毕后将立即自动发送通知提醒，届时即可一键开始分析！"
+                )
+            print(f"[File Lock] Ignored message '{clean_text[:40]}' for {session_key} while processing {fn}")
+            return
+
         parts = clean_text.split()
         cmd = parts[0].lower() if parts else ""
         norm_text = clean_text.strip("。！!？? \t\r\n")
+        strip_brackets = clean_text.strip("【】[]()（） \t\r\n")
 
         # Intercept upload-completion confirmation phrases ("文件传输结束", "上传完毕", etc.)
         if clean_text in UPLOAD_DONE_TRIGGERS or norm_text in UPLOAD_DONE_TRIGGERS:
@@ -1783,7 +1863,7 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             has_context = bool(pending_files or sess.get("conversation_id"))
 
             # 按钮 1:【新案件】
-            if clean_text in NEW_CASE_TRIGGERS or norm_text in NEW_CASE_TRIGGERS:
+            if clean_text in NEW_CASE_TRIGGERS or norm_text in NEW_CASE_TRIGGERS or strip_brackets in NEW_CASE_TRIGGERS:
                 session_mgr.reset_conversation(session_key, status="idle")
                 reply_message(
                     msg_id,
@@ -1794,7 +1874,7 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 return
 
             # 按钮 2:【结束归档】
-            if clean_text in ARCHIVE_TRIGGERS or norm_text in ARCHIVE_TRIGGERS:
+            if clean_text in ARCHIVE_TRIGGERS or norm_text in ARCHIVE_TRIGGERS or strip_brackets in ARCHIVE_TRIGGERS:
                 session_mgr.reset_conversation(session_key, status="concluded")
                 reply_message(
                     msg_id,
@@ -1805,7 +1885,8 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 return
 
             # 按钮 3:【意见书】
-            if clean_text in ["意见书", "法律意见书", "出法律意见书", "出具法律意见书", "出具意见书"]:
+            opinion_triggers = ["意见书", "法律意见书", "出法律意见书", "出具法律意见书", "出具意见书", "起草法律意见书", "起草意见书", "写意见书"]
+            if clean_text in opinion_triggers or norm_text in opinion_triggers or strip_brackets in opinion_triggers:
                 if not has_context:
                     reply_message(msg_id, "📋【提示】当前暂未上传案件材料或输入案情。\n\n请先上传案卷材料（Word、PDF 或证据图片），或在对话框中简要描述案件事实与争议，再点击【意见书】，我将立即为您出具甘肃乾祐律师事务所专业《法律意见书》。")
                     return
@@ -1818,7 +1899,8 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 return
 
             # 按钮 4:【答辩词】
-            if clean_text in ["答辩词", "答辩状", "民事答辩状", "起草答辩词", "起草答辩状", "出答辩状"]:
+            defense_triggers = ["答辩词", "答辩状", "民事答辩状", "起草答辩词", "起草答辩状", "出答辩状", "出具答辩状", "出具民事答辩状", "写答辩状"]
+            if clean_text in defense_triggers or norm_text in defense_triggers or strip_brackets in defense_triggers:
                 if not has_context:
                     reply_message(msg_id, "📋【提示】当前暂未上传起诉状或相关案卷材料。\n\n请先上传起诉状、上诉状或案卷材料（Word、PDF 或证据图片），或直接发送案件事实，再点击【答辩词】，我将为您起草专业规范的《民事答辩状》。")
                     return
@@ -1831,7 +1913,8 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 return
 
             # 按钮 5:【代理词】
-            if clean_text in ["代理词", "民事代理词", "起草代理词", "出代理词", "代理意见"]:
+            agency_triggers = ["代理词", "民事代理词", "起草代理词", "出代理词", "代理意见", "出具代理词", "出具民事代理词", "写代理词"]
+            if clean_text in agency_triggers or norm_text in agency_triggers or strip_brackets in agency_triggers:
                 if not has_context:
                     reply_message(msg_id, "📋【提示】当前暂未上传案件材料或输入案情。\n\n请先上传案卷材料（支持 Word .docx、PDF、证据图片）或在对话框中简要描述案件事实与争议，再点击【代理词】，我将为您起草专业规范的《民事代理词》。")
                     return
@@ -1845,8 +1928,9 @@ def on_message_received(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 executor.submit(execute_agent_task, session_key, msg_id, agency_prompt, parent_chat_id)
                 return
 
-            # 辅助命令:【分析】
-            if clean_text in ["分析", "案情分析", "法律分析", "研判", "深度分析", "开始分析"]:
+            # 辅助命令:【综合案情研判 / 分析】
+            analysis_triggers = ["综合案情研判", "案情研判", "综合研判", "分析", "案情分析", "法律分析", "研判", "深度分析", "开始分析"]
+            if clean_text in analysis_triggers or norm_text in analysis_triggers or strip_brackets in analysis_triggers:
                 if not has_context:
                     reply_message(msg_id, "📋【提示】当前暂未上传案件材料或输入案情。\n\n请先上传案卷材料（支持 Word .docx、PDF、证据图片）或简要输入案情，再点击【分析】，我将为您进行深度事实穿透与法律综合研判。")
                     return
