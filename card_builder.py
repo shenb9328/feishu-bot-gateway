@@ -155,23 +155,23 @@ def build_upload_progress_card(
         }
 
     elif status_stage == "rendering":
-        step_text = detail_msg or "正在将扫描件 PDF 逐页渲染为高清原件..."
+        step_text = detail_msg or "正在将扫描件 PDF 逐页高清渲染与图文识别..."
         elements = [
             {
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
                     "content": (
-                        f"**📁 渲染材料:** 《{file_name}》 {multi_file_prefix}（{size_str}）\n"
-                        f"**📄 案卷渲染:** {step_text}\n\n"
-                        f"⏳ 扫描件高清原件渲染中，完成后将自动供 AI 进行法律视觉审读..."
+                        f"**📁 处理材料:** 《{file_name}》 {multi_file_prefix}（{size_str}）\n"
+                        f"**📄 案卷解析:** {step_text}\n\n"
+                        f"⏳ 扫描件高清原件渲染与高精 OCR 文字识别中，识别后将直接汇入本案材料库供 AI 秒级起草文书..."
                     )
                 }
             }
         ]
         return {
             "config": {"wide_screen_mode": True},
-            "header": {"title": {"tag": "plain_text", "content": "📄 案卷高清原件渲染中..."}, "template": "orange"},
+            "header": {"title": {"tag": "plain_text", "content": "⚙️ 案卷渲染与图文识别中..."}, "template": "orange"},
             "elements": elements
         }
 

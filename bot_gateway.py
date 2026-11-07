@@ -10,8 +10,9 @@ import datetime
 import requests
 import subprocess
 import threading
+import shutil
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -828,6 +829,57 @@ def extract_docx_text_builtin(file_path: str) -> str:
     return "\n".join(lines)
 
 
+TESSERACT_BIN = shutil.which("tesseract") or ("/usr/bin/tesseract" if os.path.exists("/usr/bin/tesseract") else None)
+
+
+def ocr_single_image(img_path: str) -> str:
+    """Performs fast OCR on a single scanned page image using tesseract chi_sim."""
+    if not TESSERACT_BIN or not os.path.exists(img_path):
+        return ""
+    try:
+        res = subprocess.run(
+            [TESSERACT_BIN, img_path, "stdout", "-l", "chi_sim", "--oem", "1"],
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False
+        )
+        return res.stdout.strip()
+    except Exception as e:
+        print(f"[OCR Error] {img_path}: {e}")
+        return ""
+
+
+def ocr_images_batch(
+    image_paths: List[str],
+    status_cb: Optional[Callable[[str, str], None]] = None,
+    doc_name: str = "",
+    max_workers: int = 2
+) -> List[str]:
+    """Runs parallel OCR across images and reports progress via status_cb."""
+    total = len(image_paths)
+    if not total or not TESSERACT_BIN:
+        return []
+
+    results = [""] * total
+    completed = 0
+    prefix = f"《{doc_name}》" if doc_name else "扫描件案卷"
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(ocr_single_image, path): i for i, path in enumerate(image_paths)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception:
+                results[idx] = ""
+            completed += 1
+            if status_cb and (completed % 2 == 0 or completed == total):
+                status_cb("rendering", f"{prefix}正在进行智能高精图文识别 (第 {completed}/{total} 页)...")
+
+    return results
+
+
 def render_pdf_to_images(pdf_path: str, max_pages: int = 100) -> List[str]:
     """Renders a scanned PDF into optimized JPEG images inside the current case directory so the LLM can read them directly."""
     base_dir = os.path.dirname(pdf_path)
@@ -906,16 +958,32 @@ def extract_text_from_file(file_path: str, status_cb: Optional[Callable[[str, st
                     f.write(cleaned_out)
                 return cleaned_out, [], warnings
             else:
-                # Scanned image PDF: clean empty txt file and render pages to optimized JPEG
+                # Scanned image PDF: clean empty txt file, render pages to optimized JPEG, and run parallel OCR
+                doc_name = os.path.basename(file_path)
                 if status_cb:
-                    status_cb("rendering", f"识别为扫描件 PDF，正在高清逐页渲染中（供 AI 法律视觉研判）...")
+                    status_cb("rendering", f"识别《{doc_name}》为扫描件 PDF，正在高清逐页渲染中...")
                 if os.path.exists(txt_path):
                     try:
                         os.remove(txt_path)
                     except OSError:
                         pass
                 rendered_pages = render_pdf_to_images(file_path, max_pages=100)
-                return "", rendered_pages, warnings
+
+                ocr_text = ""
+                if rendered_pages and TESSERACT_BIN:
+                    if status_cb:
+                        status_cb("rendering", f"《{doc_name}》正在进行智能高精图文识别 (共 {len(rendered_pages)} 页)...")
+                    page_texts = ocr_images_batch(rendered_pages, status_cb=status_cb, doc_name=doc_name, max_workers=2)
+                    combined_ocr = []
+                    for p_i, p_txt in enumerate(page_texts):
+                        if p_txt.strip():
+                            combined_ocr.append(f"--- 《{doc_name}》第 {p_i+1} 页 (扫描件图文识别) ---\n{p_txt.strip()}")
+                    ocr_text = "\n\n".join(combined_ocr).strip()
+                    if ocr_text:
+                        with open(txt_path, "w", encoding="utf-8") as f:
+                            f.write(ocr_text)
+
+                return ocr_text, rendered_pages, warnings
 
         elif ext in (".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".cbr", ".r00"):
             if status_cb:
@@ -967,7 +1035,15 @@ def extract_text_from_file(file_path: str, status_cb: Optional[Callable[[str, st
             return full_arch_text, rendered_pages, warnings
 
         elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]:
-            return "", [file_path], warnings
+            ocr_text = ""
+            if TESSERACT_BIN:
+                if status_cb:
+                    status_cb("rendering", f"正在对证据图片《{os.path.basename(file_path)}》进行图文识别...")
+                ocr_text = ocr_single_image(file_path)
+                if ocr_text:
+                    with open(txt_path, "w", encoding="utf-8") as f:
+                        f.write(ocr_text)
+            return ocr_text, [file_path], warnings
 
         elif ext in [".txt", ".md", ".json", ".csv"]:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1175,7 +1251,10 @@ def handle_incoming_files_batch(
             has_extracted = bool(extracted_text)
 
             if has_extracted:
-                extract_note = f"（已预解析纯文本 {len(extracted_text)} 字）"
+                if rendered_pages:
+                    extract_note = f"（已预解析纯文本 {len(extracted_text)} 字，含扫描件OCR）"
+                else:
+                    extract_note = f"（已预解析纯文本 {len(extracted_text)} 字）"
             elif rendered_pages:
                 extract_note = f"（扫描件PDF，已自动渲染 {len(rendered_pages)} 页高清图片供AI直读）"
             elif resource_type == "image":
@@ -1453,7 +1532,7 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
             stderr_thread = threading.Thread(target=read_stderr, daemon=True)
             stderr_thread.start()
 
-            for line in proc.stdout:
+            for line in iter(proc.stdout.readline, ""):
                 line = line.strip()
                 if not line:
                     continue
