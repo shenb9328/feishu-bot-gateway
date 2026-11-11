@@ -1,69 +1,134 @@
-# 🤖 Feishu Agent Gateway (飞书全能智能体网关)
+# 🤖 Feishu Agent Gateway (飞书全能智能体网关) & ⚖️ 乾祐法律实务智能体
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Lark Open Platform](https://img.shields.io/badge/Feishu-Open%20Platform-00D6B9.svg)](https://open.feishu.cn/)
 [![Antigravity Compatible](https://img.shields.io/badge/Antigravity-Skill%20Ready-4285F4.svg)](https://antigravity.google)
 
-基于飞书官方 **WebSocket 长连接（无需公网 IP、无需域名、无需内网穿透）**，将本地 **Google Antigravity 编码智能体** 深度接入飞书客户端的高可用网关。
+基于飞书官方 **WebSocket 长连接（无需公网 IP、无需域名、无需内网穿透）**，将 **Google Antigravity 编码/法律智能体** 深度接入飞书客户端的高可用网关系统。
 
-支持在手机或电脑飞书随时下发 Linux 运维命令、编写与调试代码、切换不同项目工作区，并在话题群中享受与 IDE 1:1 对应的原生分栏体验。
+不仅支持在手机或电脑飞书随时下发 Linux 运维命令、编写与调试代码、切换不同项目工作区，更内建了行业标杆级的 **甘肃乾祐律师事务所专业实务法律智能体**，支持百页案卷秒级解析与高规格诉讼文书起草。
+
+> 📖 **面向 AI 智能体开发者的专业技术白皮书**：详见 [LEGAL_AGENT_SPEC.md](LEGAL_AGENT_SPEC.md)。
 
 ---
 
-## 🌟 核心特性
+## 🌟 核心特性总览
 
+### 1. 通用网关与协同底座
 - ⚡ **零公网依赖**：采用官方 WebSocket 长连接模式，任何处于内网、云开发机或私有 VPS 的主机均可秒级接入，彻底告别域名、SSL 证书与反向代理。
-- 🤖 **单内核并发多租户 / 多机器人**：支持 1 个 Antigravity 智能体（agy）同时链接 \(n\) 个不同飞书企业/个人账户下的 \(m\) 个机器人，多实例进程级隔离、会话与存储天然物理独立。
-- 🔍 **零配置机器人自动探测**：启动时自动调用飞书官方 OpenAPI 获取机器人名称与 Open ID，告别繁杂的硬编码配置。
-- 📁 **多项目工作区隔离**：自动扫描主目录与工作区项目（如 `飞书`、`腾讯云` 等），使用 `/project <名>` 即可秒级切换工作目录。
-- 🌳 **飞书话题群（Topic Group）1:1 映射**：
-  - **群组** = 本地项目（Project / Workspace）
-  - **话题（Topic）** = 独立会话（Conversation）
-  - 左侧话题列表一目了然，右侧独立承接上下文，互不串台。
-- 💬 **彻底免 @ 直接交互**：群内无需每次艾特机器人，像与真人聊天一样直接打字发回车，机器人秒级响应。
-- ☯️ **双轨混合智能排盘体系 (Metaphysics Dual-Track)**：
-  - **⚡ 0.08 秒极速直通**：常规或明确时间指令（如 `排盘`、`排盘，乌鲁木齐`、`排盘，时间2026年9月22日14点30分`）纯内存直接出盘，回车秒出；
-  - **🤖 1.2 秒 AI 智能换算**：相对时间与口语指令（如 `明天下午三点`、`下周五上午10点半`、`农历中秋节`、`午时`）以及区县地理（如 `高台县` 自动提取东经 99.82°），由本地最快模型秒级精准抽取，真太阳时无懈可击；
-  - **🎯 语序自由与全句识别**：“排盘”在句首、句中或句末（如“高台县排盘”、“帮我排盘”）均能精准识别，杜绝误入慢速任务；
-  - **🔮 连发与接续解读**：支持“排盘并解读”、“排盘，看下合作能否顺利”，先秒级出盘，再由 Agent 针对具体问题紧随输出易理推演。
-- 📜 **多轮会话回溯管理**：内置 `/new`（开新会话）、`/history`（历史清单）与 `/switch <序号>`（一秒切回），随时承接不同上下文。
-- 🎨 **飞书原生富文本卡片**：状态面板、项目列表、历史会话全以交互卡片形式精致展现。
+- 🤖 **单内核并发多租户 / 多机器人**：支持 1 个 Antigravity 智能体（`agy`）同时驱动 \(n\) 个飞书企业/个人账号下的 \(m\) 个机器人，多实例进程级隔离、会话与存储天然物理独立。
+- 🔍 **零配置机器人自动探测**：启动时自动调用飞书官方 OpenAPI 获取机器人名称与 Open ID，告别硬编码。
+- 📁 **多项目工作区隔离**：自动扫描工作区目录，支持使用 `/project <名>` 秒级切换。
+- 🌳 **飞书话题群（Topic Group）1:1 映射**：群组 = 项目工作区，群内话题 = 独立会话，左侧话题列表一目了然，右侧独立承接上下文。
+- 💬 **彻底免 @ 直接交互**：群内无需每次艾特机器人，打字按回车即刻响应。
 - 🛡️ **开机与崩溃自愈守护**：通过 Linux Systemd 模板服务托管，配置 Linger 免登录自启，服务永久在线。
+
+### 2. ⚖️ 甘肃乾祐法律实务智能体专属特性 (Qianyou Legal Edition)
+- 🔒 **案件目录级物理隔离（防串案最高铁律）**：为每一次独立办案生成独立的物理目录（`cases/case_YYYYMMDD_HHMMSS_<rand>/`），进程执行目录物理锁死，绝对禁止跨案串卷。
+- ⚡ **本地高精 Pre-OCR 移峰填谷（0 agy 算力消耗）**：
+  - 针对大文件扫描件 PDF、压缩包（`.7z`、`.rar`、`.zip`）及证据图片，自动在文件上传阶段调用本地多线程 Tesseract OCR 引擎提取文字。
+  - **完全不消耗云端大模型 Token 费用与 agy 步骤**，将意见书生成耗时从 4 分钟直接降至 **15～25 秒**！
+- 🛑 **会话级解析防扰互斥锁 (`file_busy_lock`)**：
+  - 案卷解压与 OCR 期间，系统自动锁定并忽略用户提前发起的分析点击，内置防刷屏节流提示。
+  - 全部材料解析完毕后，在会话底部主动发出醒目的【案卷材料解析完毕 · 请指示】就绪提醒。
+- 📊 **动态流式实时卡片（0 缓存延迟）**：
+  - 毫秒级初始交互卡片响应；
+  - 3.5 秒平滑递增打点动画（`[████████░░] 65%`）；
+  - 基于 `stream-json` 零缓存实时解析，精确显示“正在精读在案证据《XXX》...”、“正在起草文书正文...”。
+- 📝 **乾祐律师实务体例与法理规则穿透**：
+  - 严格依照《民诉法解释》第90条举证责任分配与证明要件对齐；
+  - 模版 A《法律意见书》、模版 B《民事答辩状》、《民事代理词》、《综合案情研判》一键规范出具。
 
 ---
 
 ## 🚀 架构设计
 
 ```mermaid
-flowchart LR
-    subgraph 飞书多租户平台
-        Bot1[账户 A: 研发助手]
-        Bot2[账户 B: 运维助手]
+flowchart TD
+    subgraph FeishuClient["飞书客户端 (桌面端 / 移动端)"]
+        UserAction["用户交互: 案卷上传 (7z/rar/pdf/doc) / 点击办案按钮"]
+        FeishuCard["实时交互: 动态流式进度卡片 / 案卷材料清单 / 规范文书"]
     end
 
-    subgraph 网关服务集群 [Linux 守护进程]
-        GW1[feishu-agent 默认实例]
-        GW2[feishu-agent@bot2 实例]
+    subgraph GatewayCluster["网关服务集群 (Linux Systemd / Python 3.10+)"]
+        WS["飞书官方 WebSocket 长连接网关 (免公网/免端口映射)"]
+        Router["事件分发器 (消息去重 / 多租户配置路由)"]
+        
+        subgraph Preprocess["案卷极速预解析引擎"]
+            Extractor["归档解压 (7z / unrar / docx XML)"]
+            Renderer["PDF 逐页高清渲染 (pdftoppm -jpeg 120DPI)"]
+            LocalOCR["本地多线程 OCR 引擎 (tesseract chi_sim, 0 agy算力)"]
+        end
+        
+        subgraph LockEngine["状态机与全局锁管理器"]
+            FileBusyLock["会话级案卷解析锁 (file_busy_lock)"]
+            TaskLock["文书起草非阻塞互斥锁 (task_lock)"]
+        end
+
+        Ticker["异步卡片心跳打点器 (3.5s平滑打点 / stream-json解析)"]
     end
 
-    subgraph 本地核心引擎 [Antigravity Core]
-        Agy[统一 Antigravity Agent 内核\n(/usr/local/bin/agy)]
-        Workspaces[隔离项目工作区 / Linux 环境]
+    subgraph Storage["磁盘物理隔离存储 (session_manager.py)"]
+        CaseDir["cases/case_YYYYMMDD_HHMMSS_xxxx/"]
+        Materials["materials/ (原始案卷 / 解压原件 / pages_切片 / 全文txt)"]
+        SessionDB["sessions.<bot>.json (会话上下文 / 材料清单)"]
     end
 
-    Bot1 ==WebSocket 长连接==> GW1
-    Bot2 ==WebSocket 长连接==> GW2
+    subgraph AntigravityCore["Antigravity 智能体核心引擎"]
+        AgyProcess["agy 进程 (CWD 物理限制在当前 case_dir)"]
+        DefaultBrain["默认大脑: gemini-3.8-flash-medium (100万长上下文 / 15秒极速交付)"]
+        HeavyBrain["按需旗舰大脑: claude-opus-4-6-thinking / gemini-3.8-flash-high"]
+    end
 
-    GW1 -->|并发上下文调度| Agy
-    GW2 -->|并发上下文调度| Agy
+    UserAction -->|WebSocket 推送| WS --> Router
+    Router -->|案卷文件/图片| Preprocess
+    Preprocess -->|加锁| FileBusyLock
+    Preprocess --> Extractor --> Renderer --> LocalOCR
+    LocalOCR --> Materials
+    Preprocess -->|释放锁并主动通知| LockEngine --> WS --> FeishuCard
 
-    Agy <--> Workspaces
-    Agy -->|执行输出| GW1
-    Agy -->|执行输出| GW2
-    GW1 ==推送信令/卡片==> Bot1
-    GW2 ==推送信令/卡片==> Bot2
+    Router -->|分析/出具文书指令| LockEngine
+    LockEngine -->|检测若正在OCR| Router -.->|拦截忽略并友好提醒| WS
+    LockEngine -->|案卷就绪且未占用| TaskLock --> AgyProcess
+
+    AgyProcess -->|读取材料| Materials
+    AgyProcess --> DefaultBrain
+    AgyProcess --> HeavyBrain
+    AgyProcess -->|stream-json 输出| Ticker
+    Ticker -->|PATCH 更新| WS --> FeishuCard
+    AgyProcess -->|完整专业法律文书| WS --> FeishuCard
 ```
+
+---
+
+## 📖 交互指令与操作指南
+
+### 1. ⚖️ 法律机器人专属交互指令（支持点击卡片按钮或直接回复文字）
+
+| 快捷指令 | 包含别名 | 作用说明 |
+| :--- | :--- | :--- |
+| **`【综合案情研判】`** | `综合案情研判`、`案情研判`、`分析`、`法律分析` | 全面梳理核心法律事实与证据链条（证实事实、存疑点、证据瑕疵），穿透争议焦点，评估举证责任与诉讼风险。 |
+| **`【出具法律意见书】`** | `法律意见书`、`意见书`、`起草法律意见书`、`写意见书` | 严格按照甘肃乾祐律师事务所**模版 A 标准体例**秒级出具完整严谨的《法律意见书》（事实查明、争议焦点对齐、实体与程序法评估、实操方案）。 |
+| **`【起草民事答辩状】`** | `民事答辩状`、`答辩状`、`答辩词`、`起草答辩状` | 严格以甘肃乾祐律师事务所出庭律师身份，站在我方答辩人立场出具**模版 B 标准体例**《民事答辩状》（针对诉请逐项反驳、抗辩事由与举证责任分配）。 |
+| **`【起草代理词】`** | `民事代理词`、`代理词`、`起草代理词`、`代理意见` | 站在我方委托人立场起草完整正规、论证严密的出庭《民事代理词》（法庭称谓、证据闭环证明力、法条深度援引、主张请求总结）。 |
+| **`【新案件】`** | `新案`、`办理新案件`、`下一案件` | 彻底重置并物理归档当前案件，**自动创建全新的独立案卷隔离工作区**，新案卷归集从零开始，杜绝串案。 |
+| **`【结束归档】`** | `结案`、`结案归档`、`归档` | 将当前案件正式结案封存并闭环隔离，释放工作区。 |
+
+---
+
+### 2. 通用工作区与运维指令
+
+| 指令 | 别名 | 作用说明 |
+| :--- | :--- | :--- |
+| **`/help`** | `帮助`、`/menu`、`/card` | 弹出 **🤖 工作台控制面板** 交互卡片 |
+| **`/status`** | `状态` | 查看当前工作区目录、模型、会话 ID 与近期任务记录 |
+| **`/model`** | `模型` | 查看或切换模型（如 `/model pro`、`/model high`、`/model reset`） |
+| **`/projects`**| `项目`、`/项目列表` | 弹出 **📂 项目工作区列表** 卡片，展示所有可用本地项目 |
+| **`/project <名>`** | `切项目` | 切换工作目录至目标项目（如 `/project 飞书`），并重置上下文 |
+| **`/new`** | `新建会话`、`/clear` | 开启全新会话，上一会话自动归档至历史记录 |
+| **`/history`** | `历史`、`历史会话` | 弹出 **📜 历史会话列表** 卡片，列出近期会话及轮次 |
+| **`排盘`** | `起盘`、`算卦` | 内置双轨排盘引擎，支持真太阳时推演与连发解读 |
 
 ---
 
@@ -81,100 +146,45 @@ flowchart LR
    - 进入「开发配置 -> 事件与回调」；
    - 订阅方式选择 **「长连接模式」**；
    - 添加事件：**`接收消息 (im.message.receive_v1)`**。
-4. **创建并发布版本**：
-   - 在「版本管理与发布」中提交并发布一次版本生效。
+4. **发布版本**：
+   - 在「版本管理与发布」中提交并发布一次版本即可。
 
 ---
 
-## 📦 新电脑 / 新服务器一键安装
+## 📦 部署与运行
 
-在新机器上克隆本项目，运行自动安装脚本即可：
-
+### 1. 系统底层依赖安装
 ```bash
-git clone git@github.com:shenb9328/feishu-bot-gateway.git ~/.feishu-agent
-cd feishu-agent
-chmod +x install.sh
-./install.sh
+# Ubuntu / Debian
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim poppler-utils p7zip-full unrar-free python3-pip
+
+# Python 依赖
+pip install lark-oapi requests pypdf
 ```
 
-> **自动完成事项**：
-> 1. 安装 `lark-oapi` 依赖；
-> 2. 检查或引导生成 `config.json`；
-> 3. 注册为当前环境全局 Antigravity Skill；
-> 4. 配置 Systemd 开机守护进程并立即启动连接。
-
----
-
-## 📖 交互指令指南
-
-在飞书单聊或群聊中，直接发送以下指令（支持斜杠或纯汉字）：
-
-| 指令 | 别名 | 作用说明 |
-| :--- | :--- | :--- |
-| **`/help`** | `帮助`、`/menu`、`/card` | 弹出 **🤖 工作台控制面板** 交互卡片 |
-| **`/status`** | `状态`、`/状态` | 查看当前绑定的工作区目录、运行模型、会话 ID 与近期任务记录 |
-| **`/model`** | `模型`、`/模型` | 查看或切换当前话题的模型（如 `/model pro`、`/model high`、`/model reset`） |
-| **`/projects`**| `项目`、`/项目列表` | 弹出 **📂 项目工作区列表** 卡片，展示所有可用项目 |
-| **`/project <名>`** | `切项目` | 切换工作目录至目标项目（如 `/project 飞书`），并重置上下文 |
-| **`/new`** | `新建会话`、`/clear` | 开启全新会话，上一会话自动归档至历史记录 |
-| **`/history`** | `历史`、`历史会话` | 弹出 **📜 历史会话列表** 卡片，列出近期会话及轮次 |
-| **`排盘`** | `起盘`、`算卦`、`paipan` | **☯️ 双轨极速排盘**：<br>• 常规时间（如 `排盘，时间2026年9月22日14点30分`、`排盘，乌鲁木齐`）：**0.08 秒直通秒出**；<br>• 相对/口语时间（如 `下周五上午10点半高台县排盘`、`明天下午三点深圳排盘并解读`）：**1.2 秒 AI 智能换算公历与区县经度**；<br>• 语序自由（“排盘”置于句首、句中或句末均可秒级识别）。 |
-| **`解读`** | `分析`、`看盘`、`断卦` | 自动调取最近一次排盘（跨话题/跨群聊自动继承），注入 Agent 进行专业深入推演；若排盘时已带诉求（如“看下合作能否顺利”），自动连发推演。 |
-| **直接发文本** | - | 本地 Agent 自动调用工具执行任务、写代码并回报。默认使用 **Gemini 3.8 Flash (Medium)**，除非特别说明（如“用pro模型...”或“--model sonnet”） |
-
----
-
-## ⚙️ 运维管理命令
-
-服务由 Linux 用户级 Systemd 托管：
-
-```bash
-# 查看默认实例运行状态
-systemctl --user status feishu-agent
-
-# 查看实时日志
-journalctl --user -u feishu-agent -f
-
-# 重启服务
-systemctl --user restart feishu-agent
-
-# 停止服务
-systemctl --user stop feishu-agent
-```
-
----
-
-## 🤖 多租户与多机器人多开指南 (1个 agy 驱动多个机器人)
-
-如果你有多个飞书租户（不同企业或个人账号），或者需要在同一台服务器上运行多个不同用途的飞书机器人（如：`研发助手`、`运维助手`、`客服测试`），只需利用内置的 **Systemd 模板服务**，无需重复安装：
-
-### 1. 创建新机器人的配置文件
-在项目目录下复制模板（如新机器人代号为 `ops`）：
-```bash
-cp config.example.json config.ops.json
-```
-编辑 `config.ops.json` 填入新机器人的 `app_id` 与 `app_secret`：
+### 2. 配置文件
+创建 `config.chenjia.json`（或默认 `config.json`）：
 ```json
 {
-  "app_id": "cli_xxxxxxxxxxxxxxxx",
-  "app_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "bot_name": "运维助手",
-  "projects_root": "/home/shenb9328_gmail_com",
-  "allowed_open_ids": []
+  "app_id": "cli_aa6c235eb338dce0",
+  "app_secret": "****************************",
+  "bot_name": "陈佳的智能助手",
+  "bot_type": "legal",
+  "default_model": "gemini-3.8-flash-medium",
+  "root_dir": "/home/shenb/.gemini/antigravity-cli/scratch"
 }
 ```
 
-### 2. 一键启动并托管新实例
+### 3. Systemd 用户服务托管
 ```bash
-# 启动并设置开机自启 (实例名与 config.<实例名>.json 一一对应)
-systemctl --user enable --now feishu-agent@ops
+# 启动法律助手实例
+systemctl --user enable --now feishu-agent@chenjia
 
-# 查看该机器人状态与日志
-systemctl --user status feishu-agent@ops
-journalctl --user -u feishu-agent@ops -f
+# 查看状态与实时流式日志
+systemctl --user status feishu-agent@chenjia
+journalctl --user -u feishu-agent@chenjia -f
 ```
-
-各机器人的会话数据将自动隔离存入 `sessions.ops.json` 与 `chat_bindings.ops.json`，独立管理，互不干扰！
 
 ---
 
