@@ -1426,6 +1426,8 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
         has_pending = bool(pending_files)
         if has_pending:
             materials_detail = []
+            cumulative_text_len = 0
+            MAX_INLINE_TOTAL_CHARS = 100000  # 累计内联纯文本上限10万字，超限时引导使用 read_file
             for i, item in enumerate(pending_files):
                 size_str = f" ({item.get('size_kb', 0)} KB)" if item.get('size_kb') else ""
                 txt_path = item.get("txt_path")
@@ -1439,8 +1441,9 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
                         pass
 
                 item_info = f"{i+1}. 《{item['name']}》{size_str} (原件路径: {item['path']})"
-                if txt_content and len(txt_content) <= 35000:
+                if txt_content and len(txt_content) <= 35000 and (cumulative_text_len + len(txt_content) <= MAX_INLINE_TOTAL_CHARS):
                     item_info += f"\n   【该文件已自动预解析全文纯文本内容如下】:\n\"\"\"\n{txt_content}\n\"\"\""
+                    cumulative_text_len += len(txt_content)
                 elif txt_content:
                     item_info += f"\n   (全文已自动预解析纯文本至: {txt_path}，共 {len(txt_content)} 字，请直接调用 read_file 阅读该 txt 文件)"
                 elif rendered_pages:
@@ -1519,7 +1522,7 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
 
         cmd = [
             "/usr/local/bin/agy",
-            "-p", actual_prompt,
+            "-p", "-",
             "--model", target_model,
             "--output-format", "stream-json",
             "--dangerously-skip-permissions"
@@ -1575,11 +1578,24 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
             proc = subprocess.Popen(
                 cmd,
                 cwd=work_dir,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1
             )
+
+            # Asynchronously pipe actual_prompt into stdin to bypass Linux MAX_ARG_STRLEN (128KB) limit
+            def write_stdin():
+                try:
+                    proc.stdin.write(actual_prompt)
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                except Exception as ex:
+                    print(f"[Agent] Stdin write error: {ex}")
+
+            stdin_thread = threading.Thread(target=write_stdin, daemon=True)
+            stdin_thread.start()
 
             # Read stderr in background
             def read_stderr():
