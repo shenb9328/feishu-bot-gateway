@@ -1509,12 +1509,18 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
         clean_title = re.sub(r'[\r\n\t]+', ' ', clean_prompt).strip()
         display_title = (clean_title[:38] + "...") if len(clean_title) > 38 else clean_title
 
+        initial_step_desc = (
+            "已建立案卷隔离工作区，正在全案通读在案材料并建立事实脉络..."
+            if IS_LEGAL_BOT
+            else ("正在结合排盘数据进行深度易理推演..." if chart and is_interpret else "正在分析处理中...")
+        )
+
         # Send initial progress card in millisecond 1
         init_card = card_builder.build_ai_progress_card(
             task_title=display_title,
             status_stage="running",
             elapsed_seconds=0,
-            step_desc="已建立案卷隔离工作区，正在全案通读在案材料并建立事实脉络...",
+            step_desc=initial_step_desc,
             progress_pct=10,
             is_legal_bot=IS_LEGAL_BOT
         )
@@ -1522,7 +1528,6 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
 
         cmd = [
             "/usr/local/bin/agy",
-            "-p", "-",
             "--model", target_model,
             "--output-format", "stream-json",
             "--dangerously-skip-permissions"
@@ -1535,7 +1540,7 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
 
         start_t = time.time()
         state = {
-            "step_desc": "正在全案通读在案材料并梳理事实脉络...",
+            "step_desc": initial_step_desc,
             "step_count": 0,
             "done": False,
             "new_cid": None,
@@ -1681,7 +1686,7 @@ def execute_agent_task(session_key: str, message_id: str, prompt: str, parent_ch
             # Update conversation memory
             new_cid = state["new_cid"]
             cur_sess = session_mgr.get_session(session_key)
-            if cur_sess.get("case_dir") == work_dir and new_cid:
+            if ((not IS_LEGAL_BOT) or cur_sess.get("case_dir") == work_dir) and new_cid:
                 session_mgr.update_conversation(session_key, new_cid, prompt)
 
             # Update progress card to complete
